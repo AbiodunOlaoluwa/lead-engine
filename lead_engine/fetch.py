@@ -39,6 +39,7 @@ class Fetcher:
     transport: FileTransport
     delay_scale: float = 0.0  # 1.0 honours the real crawl delay; tests and demos shrink it
     max_attempts: int = 3
+    source_delays: dict[str, float] = field(default_factory=dict)  # per-source rule from the catalog; never below robots.txt
     _robots: RobotFileParser | None = None
     _last: float = 0.0
 
@@ -55,9 +56,9 @@ class Fetcher:
             return row["body"]  # already fetched on an earlier run: no second request
         if not self.robots().can_fetch("lead-engine", "/" + path):
             self.conn.execute("insert or replace into pages (url, source, status) values (?, ?, 'disallowed')", (path, source))
-            db.log(self.conn, "fetch", f"robots.txt disallows {path}; skipped", "warn")
+            db.log(self.conn, "fetch", f"robots.txt disallows {path}; skipped", "warn", source)
             return None
-        delay = (self.robots().crawl_delay("lead-engine") or 0) * self.delay_scale
+        delay = max(self.robots().crawl_delay("lead-engine") or 0, self.source_delays.get(source) or 0) * self.delay_scale
         attempts = 0
         while attempts < self.max_attempts:
             attempts += 1
@@ -68,7 +69,7 @@ class Fetcher:
             try:
                 body = self.transport.get(path)
             except TransientError as e:
-                db.log(self.conn, "fetch", f"{e}; retrying ({attempts}/{self.max_attempts})", "warn")
+                db.log(self.conn, "fetch", f"{e}; retrying ({attempts}/{self.max_attempts})", "warn", source)
                 time.sleep(0.01 * 2**attempts * self.delay_scale)
                 continue
             self.conn.execute(
@@ -78,5 +79,5 @@ class Fetcher:
             self.conn.commit()
             return body
         self.conn.execute("insert or replace into pages (url, source, status, attempts) values (?, ?, 'failed', ?)", (path, source, attempts))
-        db.log(self.conn, "fetch", f"gave up on {path} after {attempts} attempts", "error")
+        db.log(self.conn, "fetch", f"gave up on {path} after {attempts} attempts", "error", source)
         return None

@@ -12,6 +12,8 @@ const STAGES = [
   { key: "score", name: "Score", note: "Points anyone can read" },
 ];
 
+const SOURCE_NAMES = { portal: "Property portal", register: "Professional register", profile: "Firm profile pages" };
+
 let state = null;
 let pace = "watch";
 let contactFilter = "all";
@@ -63,7 +65,7 @@ async function onJob(job) {
   if (!state) return;
   const was = state.job?.state;
   state.job = job;
-  if (job.kind === "run" && job.state === "done" && job.result) state.summary = job.result; // final numbers arrive with the "done" message
+  if ((job.kind === "run" || job.kind === "rescore") && job.state === "done" && job.result) state.summary = job.result; // final numbers arrive with the "done" message
   const tab = currentTab();
   if (tab === "run") renderRunLive();
   if (tab === "evals" && job.kind === "eval") renderEvalsLive();
@@ -99,6 +101,7 @@ function summaryTiles(s) {
     tile(s.contacts, "contacts after matching"),
     tile(s.review_pairs, "pairs waiting for you", s.review_pairs ? "held" : ""),
     tile(s.tier1, "tier 1 contacts", "ok"),
+    tile(s.outside_icp, "outside the ICP, held back from export"),
   ].join("");
 }
 
@@ -115,6 +118,7 @@ function renderRun() {
       <div class="facts">
         <span class="fact">${state.site.firms} firms</span><span class="fact">${state.site.listings} listings</span>
         <span class="fact">.example domains</span><span class="fact">0800 555 numbers</span>
+        <span id="icp-facts" style="display:contents"></span>
       </div>
     </div>
     <div class="card controls">
@@ -183,10 +187,11 @@ function renderRunLive() {
     let cls = st.state; // pending | running | done | stopped, exactly as the engine reported it
     if (fromLastRun) cls = "done";
     if (job.kind === "eval" || job.kind === "generate") cls = fromLastRun ? "done" : state.has_run ? "done" : "pending";
-    const pct = st.total ? Math.min(100, Math.round((st.done / st.total) * 100)) : cls === "done" ? 100 : 0;
+    const pct = st.total ? Math.min(100, Math.round((st.done / st.total) * 100)) : cls === "done" || cls === "kept" ? 100 : 0;
     const count =
       fromLastRun || job.kind === "eval" || job.kind === "generate"
         ? state.has_run ? "done on the last run" : "waiting"
+        : cls === "kept" ? "kept from the last run"
         : cls === "stopped" ? `crashed at ${st.done} of ${st.total}`
         : cls === "done" ? (st.total ? `${st.total} of ${st.total}` : "nothing new to do")
         : cls === "running" ? (st.total ? `${st.done} of ${st.total}` : "planning…")
@@ -205,12 +210,14 @@ function renderRunLive() {
     </article>`;
   }).join("");
 
-  const label = { run: "the pipeline", drill: "the crash drill", eval: "the evals", generate: "the generator" }[job.kind] ?? "";
+  const label = { run: "the pipeline", drill: "the crash drill", eval: "the evals", generate: "the generator", rescore: "the rescore" }[job.kind] ?? "";
+  const blocked = state.blocked && job.state !== "running";
   const text =
     job.state === "running"
       ? `Running ${label}${job.current ? `: ${job.current}` : ""} · ${job.seconds}s`
+      : blocked ? state.blocked
       : job.message || (state.has_run ? "Results from the last run are below. Run again, crash it, or explore the other tabs." : "Nothing has run yet. Press Run the pipeline.");
-  $("#status").innerHTML = `<div class="status ${job.state}">${job.state === "running" ? '<span class="pulse"></span>' : ""}<span>${esc(text)}${job.phase ? `<span class="phase">${esc(job.phase)}</span>` : ""}</span></div>`;
+  $("#status").innerHTML = `<div class="status ${blocked ? "failed" : job.state}">${job.state === "running" ? '<span class="pulse"></span>' : ""}<span>${esc(text)}${blocked ? ' <a href="#sources">Open Sources</a>' : ""}${job.phase ? `<span class="phase">${esc(job.phase)}</span>` : ""}</span></div>`;
 
   // Numbers only show once the engine says the run is finished; mid-run they would be half-true.
   const midRun = (job.state === "running" || job.state === "interrupted") && (job.kind === "run" || job.kind === "drill");
@@ -221,13 +228,22 @@ function renderRunLive() {
       : summaryTiles(state.summary);
   for (const id of ["run-btn", "crash-btn", "drill-btn", "reset-btn"]) {
     const b = $("#" + id);
-    if (b) b.disabled = job.state === "running";
+    if (b) b.disabled = job.state === "running" || (id !== "reset-btn" && !!state.blocked);
   }
   const resume = $("#resume-btn");
   if (resume) resume.disabled = !(job.state === "interrupted" && job.kind === "run");
 
   const drill = $("#drill-card");
-  if (job.kind === "drill" && job.state === "done" && job.result) {
+  if (job.kind === "rescore" && job.result?.rescore) {
+    const r = job.result.rescore;
+    const line = (name, k) => `<tr><td>${name}</td><td class="num">${r.before[k]}</td><td class="num">${r.after[k]}</td></tr>`;
+    drill.innerHTML = `<div class="section-head"><h2 style="font-size:19px">Rescore</h2><span class="chip c-ok">ICP version ${r.version}</span></div>
+      <p class="lede" style="margin-top:8px">Only the score stage ran. The pages, extractions, lookups and matches from the last run were kept as they were.</p>
+      <table style="margin-top:10px"><thead><tr><th>Contacts</th><th>Before</th><th>After</th></tr></thead><tbody>
+        ${line("Tier 1", "tier1")}${line("Tier 2", "tier2")}${line("Tier 3", "tier3")}${line("Outside the ICP", "outside")}
+      </tbody></table>
+      <p style="margin-top:10px"><a class="btn btn-ghost btn-sm" href="#contacts">See the contacts</a> <a class="btn btn-ghost btn-sm" href="#target">Back to Target</a></p>`;
+  } else if (job.kind === "drill" && job.state === "done" && job.result) {
     const r = job.result;
     const ok = Object.keys(r.differences).length === 0;
     drill.innerHTML = `<div class="section-head"><h2 style="font-size:19px">Crash drill</h2>${ok ? '<span class="chip c-ok">passed</span>' : '<span class="chip c-bad">failed</span>'}</div>
@@ -245,6 +261,11 @@ function renderRunLive() {
   } else {
     drill.innerHTML = `<div class="section-head"><h2 style="font-size:19px">Crash drill</h2><span class="chip c-held">running</span></div><p class="lede" style="margin-top:8px">${esc(job.phase)}</p>`;
   }
+  const facts = $("#icp-facts");
+  if (facts)
+    facts.innerHTML = `<a class="fact fact-link" href="#target">Target: ICP version ${state.icp.version}</a>${
+      state.has_run && state.icp.scored_with && state.icp.scored_with !== state.icp.version && job.state !== "running"
+        ? `<a class="fact fact-held" href="#target">Contacts scored with version ${state.icp.scored_with}: rescore</a>` : ""}`;
   renderEvents(job);
 }
 
@@ -271,22 +292,25 @@ function renderEvents(job) {
 async function renderContacts() {
   if (!state.has_run) return emptyRun("No contacts yet.");
   const rows = await api(`/api/contacts?q=${encodeURIComponent(contactQuery)}`);
+  if (currentTab() !== "contacts") return;
   const filtered = rows.filter((r) =>
-    contactFilter === "tier1" ? r.tier === 1 : contactFilter === "tier2" ? r.tier === 2 : contactFilter === "review" ? r.needs_review : contactFilter === "noemail" ? !r.email : true,
+    contactFilter === "tier1" ? r.tier === 1 : contactFilter === "tier2" ? r.tier === 2 : contactFilter === "review" ? r.needs_review
+    : contactFilter === "noemail" ? !r.email : contactFilter === "outside" ? r.outside_icp : true,
   );
   const held = rows.filter((r) => r.needs_review).length;
+  const outside = rows.filter((r) => r.outside_icp && !r.needs_review).length;
   view.innerHTML = `
   <div class="section-head"><h2>Contacts</h2><span class="mono muted">${rows.length} contacts from ${state.summary.listings} listings</span></div>
   <div class="toolbar">
     <div class="toolbar-left">
       <input class="search" id="q" type="search" placeholder="Search name, firm or city" value="${esc(contactQuery)}" aria-label="Search contacts">
       <div class="filters">
-        ${[["all", "All"], ["tier1", "Tier 1"], ["tier2", "Tier 2"], ["review", "Waiting for review"], ["noemail", "No email"]]
+        ${[["all", "All"], ["tier1", "Tier 1"], ["tier2", "Tier 2"], ["review", "Waiting for review"], ["outside", "Outside the ICP"], ["noemail", "No email"]]
           .map(([k, l]) => `<button class="filter ${contactFilter === k ? "on" : ""}" data-f="${k}">${l}</button>`)
           .join("")}
       </div>
     </div>
-    <a class="btn btn-dark btn-sm" href="/api/export.csv">Export CSV · ${rows.length - held} ready${held ? `, ${held} held for review` : ""}</a>
+    <a class="btn btn-dark btn-sm" href="/api/export.csv">Export CSV · ${rows.length - held - outside} ready${held ? `, ${held} held for review` : ""}${outside ? `, ${outside} outside the ICP` : ""}</a>
   </div>
   <div class="contacts-grid">
     <div class="table-wrap"><table>
@@ -297,7 +321,7 @@ async function renderContacts() {
           <td><strong>${esc(r.name)}</strong><span class="sub">${esc(r.firm)}</span></td>
           <td>${esc(r.city)}</td>
           <td>${r.email ? `<span class="mono">${esc(r.email)}</span><span class="sub">${statusChip(r.email_status)}</span>` : '<span class="chip c-muted">none found</span>'}</td>
-          <td>${r.sources.map((s) => `<span class="chip c-info">${esc(s)}</span>`).join(" ")}${r.needs_review ? ' <span class="chip c-held">review</span>' : ""}</td>
+          <td>${r.sources.map((s) => `<span class="chip c-info">${esc(s)}</span>`).join(" ")}${r.needs_review ? ' <span class="chip c-held">review</span>' : ""}${r.outside_icp ? ' <span class="chip c-bad">outside ICP</span>' : ""}</td>
           <td><span class="pts">${r.score}</span><span class="sub">${tierChip(r.tier)}</span></td></tr>`,
         )
         .join("")}</tbody></table>${filtered.length ? "" : '<p class="empty">Nothing matches.</p>'}</div>
@@ -311,6 +335,13 @@ async function renderContacts() {
   view.querySelectorAll("[data-f]").forEach((b) => (b.onclick = () => ((contactFilter = b.dataset.f), renderContacts())));
   view.querySelectorAll("tr.pick").forEach((tr) => (tr.onclick = () => showContact(tr.dataset.id)));
   if (selectedContact) showContact(selectedContact, false);
+}
+
+function breakdownRow(p) {
+  const mark = p.kind === "outside" ? "✕" : p.kind === "must" ? "✓" : `${p.points > 0 ? "+" : ""}${p.points}`;
+  const words = (p.evidence || []).map((e) => `“${esc(e)}”`).join(", ");
+  return `<tr class="${p.kind === "outside" ? "out" : ""}"><td class="pts ${p.points < 0 || p.kind === "outside" ? "neg" : p.kind === "must" ? "ok" : ""}">${mark}</td>
+    <td>${esc(p.why)}${words ? `<span class="sub">ICP: ${words}</span>` : ""}</td></tr>`;
 }
 
 function statusChip(s) {
@@ -328,9 +359,9 @@ async function showContact(id, scroll = true) {
   const el = $("#detail");
   if (!el) return;
   el.innerHTML = `
-    <div class="card"><div class="section-head"><h2 style="font-size:20px">${esc(d.name)}</h2>${tierChip(d.tier)}</div>
-      <p class="muted" style="margin-top:4px">${d.listings.length} listing${d.listings.length === 1 ? "" : "s"} · ${d.score} points</p>
-      <table style="margin-top:10px"><tbody>${d.breakdown.map((p) => `<tr><td class="pts ${p.points < 0 ? "neg" : ""}">${p.points > 0 ? "+" : ""}${p.points}</td><td>${esc(p.why)}</td></tr>`).join("")}</tbody></table>
+    <div class="card"><div class="section-head"><h2 style="font-size:20px">${esc(d.name)}</h2><span>${d.outside_icp ? '<span class="chip c-bad">outside the ICP</span> ' : ""}${tierChip(d.tier)}</span></div>
+      <p class="muted" style="margin-top:4px">${d.listings.length} listing${d.listings.length === 1 ? "" : "s"} · ${d.score} points · scored with <a href="#target">ICP version ${d.icp_version ?? "?"}</a></p>
+      <table class="breakdown" style="margin-top:10px"><tbody>${d.breakdown.map(breakdownRow).join("")}</tbody></table>
     </div>
     ${d.listings
       .map(
@@ -355,6 +386,7 @@ async function showContact(id, scroll = true) {
 async function renderReview() {
   if (!state.has_run) return emptyRun("Nothing to review yet.");
   const q = await api("/api/review");
+  if (currentTab() !== "review") return;
   const side = (s) => `<div class="side"><strong>${esc(s.name || "(no name)")}</strong>
     ${s.read_as && s.read_as.toLowerCase() !== (s.name || "").toLowerCase() ? `<span class="muted">read as ${esc(s.read_as)}</span>` : ""}
     <span>${esc(s.company)}</span><span class="muted">${esc(s.city || "")} · <span class="mono">${esc(s.phones.join(", ") || "no phone")}</span></span>
@@ -396,23 +428,355 @@ async function renderReview() {
   );
 }
 
+// ---------------------------------------------------------------- Target (ICP)
+// The draft lives here until it is saved, so switching tabs never loses an edit.
+let target = null;
+
+async function renderTarget() {
+  const meta = await api("/api/icp");
+  if (currentTab() !== "target") return; // the user moved on while this loaded
+  if (!target || !target.dirty) target = { meta, draft: meta.icp, dirty: false, coverage: meta.coverage, note: "", cost: 0, text: meta.icp.description };
+  else {
+    target.meta = meta;
+    target.coverage = await post("/api/icp/coverage", { icp: target.draft }); // sources may have changed since
+  }
+  if (currentTab() !== "target") return;
+  drawTarget();
+}
+
+const TYPE_NAMES = { management: "Property management", letting: "Letting", sales: "Sales" };
+const ROLE_NAMES = { principal: "Whoever runs the firm", agent: "The portal agent" };
+const FIELD_NAMES = { firm_type: "Kind of firm", rental_book: "Rental book", short_lets: "Short-lets", register: "Register", location: "City", role: "Who you reach", channel: "Reachable by", mostly_sales: "Mostly sales", exclude_locations: "Cities to leave out", "*": "Everything" };
+
+function pills(k, field, values, chosen, names = {}) {
+  return `<div class="pills" role="group">${values
+    .map((v) => `<button type="button" class="pill ${chosen.includes(v) ? "on" : ""}" data-k="${k}" data-list="${field}" data-v="${esc(v)}" aria-pressed="${chosen.includes(v)}">${esc(names[v] ?? v)}</button>`)
+    .join("")}</div>`;
+}
+
+function seg(k, field, options, current) {
+  return `<div class="segmented" role="group">${options
+    .map(([v, l]) => `<button type="button" class="${String(current) === String(v) ? "on" : ""}" data-k="${k}" data-set="${field}" data-v="${v}">${esc(l)}</button>`)
+    .join("")}</div>`;
+}
+
+function critRow(k) {
+  const c = target.draft.criteria[k];
+  const label = target.meta.labels[k];
+  const v = target.meta.vocab;
+  const num = (f, value, placeholder, extra = "") =>
+    `<input class="inline-num" type="number" inputmode="numeric" data-k="${k}" data-num="${f}" value="${value ?? ""}" placeholder="${placeholder}" ${extra}>`;
+  const body = {
+    firm_type: () => pills(k, "types", v.firm_types, c.types, TYPE_NAMES) + `<label class="inline muted">+ ${num("name_points", c.name_points, "0", 'aria-label="Points when the firm name says it"')} pts when the firm's name says it</label>`,
+    rental_book: () => `<label class="inline">At least ${num("min", c.min, "any", 'min="0"')}</label><label class="inline">at most ${num("max", c.max, "any", 'min="0"')}</label><span class="unit">homes for rent</span><span class="muted">Leave both empty and a bigger book simply earns more, up to the points.</span>`,
+    short_lets: () => `<label class="inline">At least ${num("min", c.min, "any", 'min="0"')}</label><span class="unit">short-lets</span><span class="muted">Leave it empty and more short-lets earn more, up to the points.</span>`,
+    register: () => `<span class="muted">Licensed members, matched to the firm across sources.</span>`,
+    location: () => pills(k, "cities", v.cities, c.cities),
+    role: () => pills(k, "roles", v.roles, c.roles, ROLE_NAMES),
+    channel: () => seg(k, "value", [["email", "Email"], ["phone", "Phone"], ["either", "Either"]], c.value) + `<span class="muted">A contact you can't reach isn't a lead, so this is always a must-have.</span>`,
+    mostly_sales: () => seg(k, "must", [[false, "Lose points"], [true, "Leave out"]], c.must) + `<span class="muted">Firms with more than twice as many homes for sale as for rent and short-let.</span>`,
+    exclude_locations: () => pills(k, "cities", v.cities, c.cities),
+  }[k]();
+  const phrases = [...new Set(c.evidence.map((e) => e.phrase))];
+  const fixedMust = k === "channel" || k === "exclude_locations";
+  const must =
+    k === "mostly_sales" ? "" : fixedMust ? '<span class="chip c-info">always a must</span>'
+      : `<label class="must"><input type="checkbox" data-k="${k}" data-flag="must" ${c.must ? "checked" : ""}> Must have</label>`;
+  const pts = k === "exclude_locations" ? "" : `<label class="pts-in">${num("points", c.points, "0", `aria-label="Points for ${esc(label)}"`)}<span>pts</span></label>`;
+  return `<div class="crit ${c.on ? "on" : "off"}" data-row="${k}">
+    <div class="crit-head">
+      <label class="switch"><input type="checkbox" data-k="${k}" data-flag="on" ${c.on ? "checked" : ""} aria-label="Use ${esc(label)}"><span></span></label>
+      <span class="crit-name">${esc(label)}</span>
+      <span class="crit-side">${must}${pts}</span>
+    </div>
+    <div class="crit-body">${body}</div>
+    <div class="crit-ev">${phrases.length ? `<span class="from">From your words</span>${phrases.map((x) => `<q>${esc(x)}</q>`).join("")}` : c.on ? "" : '<span class="muted">Not mentioned</span>'}${c.by_hand && c.on ? '<span class="chip c-held">set by hand</span>' : ""}</div>
+  </div>`;
+}
+
+function leftOutCard() {
+  const d = target.draft;
+  if (!d.dropped.length) return "";
+  return `<div class="card" style="order:4"><p class="label">Dropped: not in what you wrote</p><ul class="dropped">${d.dropped
+    .map((x) => `<li><span class="chip c-bad">dropped</span><span><b>${esc(FIELD_NAMES[x.field] ?? x.field)}</b>${x.value ? ` ${esc(x.value)}` : ""}: ${esc(x.why)}</span></li>`)
+    .join("")}</ul></div>`;
+}
+
+function versionsCard() {
+  const m = target.meta;
+  return `<div class="card" style="order:5"><p class="label">Versions</p><ul class="versions">${m.versions
+    .map(
+      (v) => `<li><span class="vnum">v${v.version}</span><span class="vtext"><span class="vdesc">${esc(v.description)}</span><span class="sub">${esc(v.parser)} · ${esc(v.created_at.replace("T", " ").slice(0, 16))} UTC</span></span>
+      ${v.version === m.version ? '<span class="chip c-ok">in use</span>' : `<button class="btn btn-ghost btn-sm" type="button" data-load="${v.version}">Load</button>`}</li>`,
+    )
+    .join("")}</ul></div>`;
+}
+
+function formStatus() {
+  const m = target.meta;
+  const running = state.job.state === "running";
+  const stale = state.has_run && m.scored_with && m.scored_with !== m.version;
+  const help = !state.has_run
+    ? "Run the pipeline once. After that, rescoring takes seconds because nothing is fetched again."
+    : target.dirty ? "Save first. Rescore always uses the saved version."
+    : stale ? `Your contacts were scored with version ${m.scored_with}. Rescore to apply version ${m.version}.`
+    : "Rescore re-runs only the score stage. Nothing is fetched or looked up again.";
+  return `
+    <button class="btn btn-dark" id="save-btn" type="button" ${target.dirty ? "" : "disabled"}>Save as version ${m.versions[0].version + 1}</button>
+    <button class="btn btn-accent" id="rescore-btn" type="button" ${!state.has_run || target.dirty || running ? "disabled" : ""}>Rescore contacts</button>
+    <p class="control-help">${esc(help)}</p>`;
+}
+
+function drawTarget() {
+  const { meta, draft } = target;
+  view.innerHTML = `
+  <div class="section-head"><h2>Target</h2><span class="mono muted">ICP version ${meta.version}${state.has_run && meta.scored_with ? ` · contacts scored with version ${meta.scored_with}` : ""}</span></div>
+  <p class="lede">Say who the list is for in plain English. The parser turns it into criteria you can check and change, and every criterion quotes the words it came from. Anything it can't find in what you wrote is dropped and listed, never guessed.</p>
+  <div class="target-grid">
+    <div class="stack">
+      <div class="card describe" style="order:1">
+        <label class="label" for="icp-text">Describe your ideal customer</label>
+        <textarea id="icp-text" rows="5" maxlength="2000" spellcheck="true">${esc(target.text)}</textarea>
+        <div class="examples"><span class="muted">Try one</span>${meta.examples.map((e, i) => `<button type="button" class="example" data-ex="${i}">${esc(e.title)}</button>`).join("")}</div>
+        <div class="control-row">
+          <button class="btn btn-accent" id="read-btn" type="button">Read it</button>
+          <span class="mode ${meta.parser === "claude" ? "claude" : ""}">${meta.parser === "claude" ? "Claude parser" : "Baseline parser"}</span>
+          ${target.cost ? `<span class="mono muted">$${(target.cost / 1e6).toFixed(4)}</span>` : ""}
+          <p class="control-help" id="text-hint">${target.text !== draft.description ? "The description has changed. Press Read it to update the criteria." : meta.parser === "claude" ? "Claude reads it with a JSON schema. The server still checks every phrase." : "The baseline knows this directory's words. Set LEAD_ENGINE_MODE=anthropic and a key to read it with Claude instead."}</p>
+        </div>
+        ${target.note ? `<p class="notice held">${esc(target.note)}</p>` : ""}
+      </div>
+      ${leftOutCard()}
+      ${versionsCard()}
+    </div>
+    <div class="stack">
+      <div class="card form-card" style="order:2">
+        <div class="section-head"><h3>Criteria</h3><span id="form-chip">${target.dirty ? '<span class="chip c-held">draft, not saved</span>' : `<span class="chip c-ok">version ${meta.version}, in use</span>`}</span></div>
+        <p class="muted small">Read by ${esc(draft.parser || "hand")}. Points are yours to change. A failed must-have puts the contact outside the ICP: it drops to tier 3 and stays out of the export.</p>
+        <div class="crit-list" id="crit-list">${meta.order.map(critRow).join("")}</div>
+        <div class="tiers">Tier 1 from <input class="inline-num" type="number" data-tier="tier1" value="${draft.tiers.tier1}" aria-label="Tier 1 threshold"> points, tier 2 from <input class="inline-num" type="number" data-tier="tier2" value="${draft.tiers.tier2}" aria-label="Tier 2 threshold"></div>
+        <div class="control-row" id="form-actions">${formStatus()}</div>
+      </div>
+      <div class="card" id="coverage" style="order:3">${coverageHtml(target.coverage)}</div>
+    </div>
+  </div>`;
+  wireTarget();
+}
+
+function edited(k, redraw) {
+  target.dirty = true;
+  if (k && redraw) {
+    const row = view.querySelector(`[data-row="${k}"]`);
+    if (row) row.outerHTML = critRow(k);
+  }
+  $("#form-chip").innerHTML = '<span class="chip c-held">draft, not saved</span>';
+  $("#form-actions").innerHTML = formStatus();
+  wireActions();
+  refreshCoverage();
+}
+
+const refreshCoverage = debounce(async () => {
+  try {
+    target.coverage = await post("/api/icp/coverage", { icp: target.draft });
+    const box = $("#coverage");
+    if (box) box.innerHTML = coverageHtml(target.coverage);
+  } catch (e) {
+    toast(e.message);
+  }
+}, 200);
+
+function wireActions() {
+  const save = $("#save-btn");
+  if (save)
+    save.onclick = async () => {
+      try {
+        const meta = await post("/api/icp", { icp: target.draft });
+        target = { meta, draft: meta.icp, dirty: false, coverage: meta.coverage, note: "", cost: 0, text: meta.icp.description };
+        await refresh();
+        drawTarget();
+        toast(state.has_run ? `Saved as version ${meta.version}. Rescore to apply it to your contacts.` : `Saved as version ${meta.version}.`);
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+  const rescore = $("#rescore-btn");
+  if (rescore) rescore.onclick = () => startJob("/api/jobs/rescore", { pace });
+}
+
+function wireTarget() {
+  const text = $("#icp-text");
+  text.oninput = () => {
+    target.text = text.value;
+    $("#text-hint").textContent = target.text !== target.draft.description ? "The description has changed. Press Read it to update the criteria." : "";
+  };
+  view.querySelectorAll("[data-ex]").forEach((b) => (b.onclick = () => {
+    target.text = target.meta.examples[Number(b.dataset.ex)].text;
+    text.value = target.text;
+    read();
+  }));
+  $("#read-btn").onclick = read;
+  view.querySelectorAll("[data-load]").forEach((b) => (b.onclick = async () => {
+    const v = await api(`/api/icp/versions/${b.dataset.load}`);
+    target.draft = v.icp;
+    target.text = v.icp.description;
+    target.dirty = true;
+    target.note = `Loaded version ${v.version}. Save it to make it the one in use.`;
+    target.coverage = await post("/api/icp/coverage", { icp: v.icp });
+    drawTarget();
+  }));
+  const list = $("#crit-list");
+  list.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-k]");
+    if (!b) return;
+    const c = target.draft.criteria[b.dataset.k];
+    if (b.dataset.list) {
+      const arr = c[b.dataset.list];
+      const i = arr.indexOf(b.dataset.v);
+      i >= 0 ? arr.splice(i, 1) : arr.push(b.dataset.v);
+      c.on = arr.length > 0;
+      c.by_hand = true;
+    } else if (b.dataset.set) {
+      c[b.dataset.set] = b.dataset.set === "must" ? b.dataset.v === "true" : b.dataset.v;
+      c.by_hand = true;
+    }
+    edited(b.dataset.k, true);
+  });
+  list.addEventListener("change", (e) => {
+    const el = e.target;
+    const k = el.dataset.k;
+    if (!k) return;
+    const c = target.draft.criteria[k];
+    if (el.dataset.flag) {
+      c[el.dataset.flag] = el.checked;
+      if (el.dataset.flag === "must") c.by_hand = true;
+      edited(k, true);
+    } else if (el.dataset.num) {
+      const f = el.dataset.num;
+      const n = el.value === "" ? null : Math.round(Number(el.value));
+      c[f] = f === "points" || f === "name_points" ? (n ?? 0) : n;
+      if (f === "min" || f === "max") c.by_hand = true;
+      edited(k, f === "min" || f === "max");
+    }
+  });
+  view.querySelectorAll("[data-tier]").forEach((el) => (el.onchange = () => {
+    target.draft.tiers[el.dataset.tier] = Math.round(Number(el.value) || 0);
+    edited(null, false);
+  }));
+  wireActions();
+}
+
+async function read() {
+  const description = ($("#icp-text")?.value ?? target.text).trim();
+  if (!description) return toast("Write a description first.");
+  const btn = $("#read-btn");
+  btn.disabled = true;
+  btn.textContent = "Reading…";
+  try {
+    const r = await post("/api/icp/parse", { description });
+    target.draft = r.icp;
+    target.text = r.icp.description;
+    target.coverage = r.coverage;
+    target.cost = r.cost_micros;
+    target.note = r.icp.note ?? "";
+    target.dirty = true;
+    drawTarget();
+    view.querySelectorAll(".crit.on").forEach((el, i) => el.style.setProperty("--i", i));
+    view.querySelector("#crit-list")?.classList.add("arrive");
+  } catch (e) {
+    toast(e.message);
+    btn.disabled = false;
+    btn.textContent = "Read it";
+  }
+}
+
+function coverageHtml(cov) {
+  const status = { covered: '<span class="chip c-ok">covered</span>', gap: '<span class="chip c-held">gap</span>', unsupported: '<span class="chip c-bad">no source</span>' };
+  const notices = [
+    cov.blocked ? `<li class="notice bad">${esc(cov.blocked)}</li>` : "",
+    ...cov.warnings.map((w) => `<li class="notice held">${esc(w)}</li>`),
+  ].join("");
+  const best = cov.suggestions.filter((s) => s.covers.length);
+  return `<div class="section-head"><h3>What your sources can give this ICP</h3><a class="mono muted" href="#sources">Manage sources</a></div>
+    <ul class="notices">${notices || '<li class="notice ok">Every criterion is covered by a source that is on.</li>'}</ul>
+    ${cov.rows.length ? `<div class="table-wrap"><table><thead><tr><th>Criterion</th><th>Sources that give it</th><th></th></tr></thead><tbody>${cov.rows
+      .map((r) => `<tr><td><b>${esc(r.label)}</b>${r.must ? ' <span class="chip c-info">must</span>' : ""}<span class="sub">needs ${esc(r.cap_label)}</span></td>
+        <td>${r.providers.length ? r.providers.map((k) => `<span class="chip ${r.live.includes(k) ? "c-ok" : "c-muted"}">${esc(SOURCE_NAMES[k])}${r.live.includes(k) ? "" : ": off"}</span>`).join(" ") : '<span class="muted">none in the catalog</span>'}</td>
+        <td>${status[r.status]}</td></tr>`)
+      .join("")}</tbody></table></div>` : '<p class="muted">Switch a criterion on to see which sources can give it.</p>'}
+    ${best.length ? `<p class="label" style="margin-top:14px">Best sources for this ICP</p><ol class="ranked">${best
+      .map((s) => `<li><span><b>${esc(s.name)}</b> covers ${s.covers.length} of ${cov.of}${s.enabled ? "" : ' <span class="chip c-held">off</span>'}</span><span class="sub">${esc(s.covers.join(", "))}</span></li>`)
+      .join("")}</ol>` : ""}`;
+}
+
 // ---------------------------------------------------------------- Sources
+function sourceCard(s, robots) {
+  const h = s.health;
+  const running = state.job.state === "running";
+  const status = s.reading
+    ? '<span class="chip c-ok">being read</span>'
+    : s.enabled && s.requires ? `<span class="chip c-held">needs the ${esc(SOURCE_NAMES[s.requires])}</span>` : '<span class="chip c-muted">off</span>';
+  const partial = s.capabilities.filter((c) => c.partial);
+  const layouts = Object.entries(h.layouts);
+  return `<article class="source ${s.reading ? "" : "is-off"}">
+    <div class="source-head">
+      <div><h3>${esc(s.name)}</h3><p class="muted">${esc(s.what)}</p></div>
+      <label class="switch"><input type="checkbox" data-src="${s.key}" ${s.enabled ? "checked" : ""} ${running ? "disabled" : ""} aria-label="Read ${esc(s.name)}"><span></span></label>
+    </div>
+    <div class="row">${status}${s.robots_allowed ? '<span class="chip c-ok">robots.txt allows it</span>' : '<span class="chip c-bad">robots.txt disallows it</span>'}</div>
+    <div class="block"><p class="label">Can give</p><div class="caps">${s.capabilities
+      .map((c) => `<span class="chip ${c.needed ? "c-ok need" : "c-muted"}" title="${c.needed ? "Your ICP uses this" : "Not used by your ICP"}">${esc(c.label)}${c.partial ? "*" : ""}</span>`)
+      .join("")}</div>${partial.length ? `<p class="small muted">${partial.map((c) => `*${esc(c.label)}: ${esc(c.partial)}`).join(". ")}.</p>` : ""}</div>
+    <div class="block rules"><p class="label">Rules</p>
+      <label class="rule"><span>Crawl delay<span class="sub">at least ${robots.crawl_delay} s, from robots.txt</span></span><span class="rule-in"><input class="inline-num" type="number" step="0.5" min="${robots.crawl_delay}" data-rule="crawl_delay" data-src="${s.key}" value="${s.crawl_delay ?? ""}" placeholder="${robots.crawl_delay}" ${running ? "disabled" : ""}><span>s</span></span></label>
+      <label class="rule"><span>Max pages<span class="sub">empty reads every page</span></span><span class="rule-in"><input class="inline-num" type="number" min="1" data-rule="max_pages" data-src="${s.key}" value="${s.max_pages ?? ""}" placeholder="all" ${running ? "disabled" : ""}><span></span></span></label>
+    </div>
+    <div class="block"><p class="label">Last run</p>
+      <dl class="stats">
+        <div><dt>fetched</dt><dd>${h.fetched}</dd></div>
+        <div><dt>failed</dt><dd class="${h.failed ? "bad" : ""}">${h.failed}</dd></div>
+        <div><dt>retried</dt><dd class="${h.retried ? "held" : ""}">${h.retried}</dd></div>
+        <div><dt>kept</dt><dd class="${h.shown !== h.kept ? "bad" : ""}">${h.kept}<small> of ${h.shown}</small></dd></div>
+      </dl>
+      ${layouts.length > 1 ? `<p class="small muted">Kept by layout: ${layouts.map(([l, n]) => `${esc(l)} ${n}`).join(", ")}</p>` : ""}
+      ${h.last_problem ? `<p class="last-problem ${h.last_problem.level === "error" ? "bad" : "held"}">${esc(h.last_problem.message)}</p>` : '<p class="small muted">No problems on record.</p>'}
+    </div>
+  </article>`;
+}
+
 async function renderSources() {
-  const [pages, robots] = await Promise.all([api("/api/pages").catch(() => []), fetch("/site/robots.txt").then((r) => (r.ok ? r.text() : ""))]);
+  const [data, pages] = await Promise.all([api("/api/sources"), api("/api/pages").catch(() => [])]);
+  if (currentTab() !== "sources") return;
+  const reading = data.sources.filter((s) => s.reading).length;
   const status = (p) =>
     p.status === "disallowed" ? '<span class="chip c-held">skipped: robots.txt</span>' : p.status === "failed" ? '<span class="chip c-bad">failed</span>' : '<span class="chip c-ok">fetched</span>';
   view.innerHTML = `
-  <div class="section-head"><h2>Sources</h2><span class="mono muted">${pages.length} pages</span></div>
-  <p class="lede">Every page the crawler touched, with how many listings it showed and how many the parser kept. A parser that skips a layout shows up here as a gap. The real one once dropped every premium listing, half of each page, without an error.</p>
-  <div class="two-col">
-    <div class="card"><p class="label">robots.txt</p><pre class="mono" style="margin:8px 0 0;white-space:pre-wrap">${esc(robots || "(generate a directory first)")}</pre>
-      <p class="muted" style="margin-top:8px">The crawler reads this first, honours the delay and never fetches the disallowed path.</p></div>
+  <div class="section-head"><h2>Sources</h2><span class="mono muted">${data.sources.length} in the catalog · ${reading} being read</span></div>
+  <p class="lede">The directories the engine knows how to read. Switch one off and the next run sets its listings aside without fetching it. Switch it back on and it is read again from scratch. Each card shows what the source can give your ICP and how it behaved on the last run.</p>
+  ${data.coverage.blocked ? `<p class="notice bad">${esc(data.coverage.blocked)}</p>` : ""}
+  <section class="catalog">${data.sources.map((s) => sourceCard(s, data.robots)).join("")}</section>
+  <section class="two-col">
+    <div class="card" id="coverage">${coverageHtml(data.coverage)}</div>
+    <div class="card no-web">
+      <p class="label">Why there is no "search the web" button</p>
+      <h3>Every field has to point at a page we can show you.</h3>
+      <ul class="reasons-list">
+        <li><b>Grounding.</b> A contact detail is only kept when it quotes a page in this catalog. Search results and scraped snippets can't be checked that way.</li>
+        <li><b>Robots and terms.</b> Each source is crawled under its own robots.txt, delay and page limits, checked before it is added. The open web can't be checked like that, site by site.</li>
+        <li><b>Quality and de-duplication.</b> A known layout is what lets the engine count listings shown against kept, read surnames the right way round, and link the same firm across sources.</li>
+      </ul>
+      <p class="small muted">Adding a source means adding a parser to this catalog, with its layouts, its rules and its tests.</p>
+    </div>
+  </section>
+  <section class="two-col">
+    <div class="card"><p class="label">robots.txt</p><pre class="mono" style="margin:8px 0 0;white-space:pre-wrap">${esc(data.robots.text || "(generate a directory first)")}</pre>
+      <p class="muted" style="margin-top:8px">The crawler reads this first, never fetches a disallowed path, and never waits less than its crawl delay.</p></div>
     <div class="card"><p class="label">Open the raw directory</p><div class="control-row" style="margin-top:8px">
       <a class="btn btn-ghost btn-sm" href="/site/portal/page-1.html" target="_blank" rel="noopener">Portal page 1</a>
       <a class="btn btn-ghost btn-sm" href="/site/register/page-1.html" target="_blank" rel="noopener">Register page 1</a>
       <a class="btn btn-ghost btn-sm" href="/site/portal/index.html" target="_blank" rel="noopener">Portal index</a></div>
       <p class="muted" style="margin-top:8px">The same mess real directories have: two card layouts, surname-first capitals, phones without the leading zero, emails written as "[at]".</p></div>
-  </div>
+  </section>
+  <div class="section-head"><h3>Every page the crawler touched</h3><span class="mono muted">${pages.length} pages</span></div>
   ${pages.length ? `<div class="table-wrap"><table><thead><tr><th>Page</th><th>Source</th><th>Status</th><th>Attempts</th><th>Shown</th><th>Kept</th><th></th></tr></thead><tbody>${pages
     .map(
       (p) => `<tr><td class="mono">${esc(p.url)}</td><td>${esc(p.source)}</td><td>${status(p)}</td>
@@ -421,6 +785,27 @@ async function renderSources() {
       <td>${p.seen == null ? "" : p.seen === p.kept ? '<span class="chip c-ok">all kept</span>' : '<span class="chip c-bad">gap</span>'} ${p.status === "ok" ? `<a class="mono muted" href="/site/${esc(p.url)}" target="_blank" rel="noopener">open</a>` : ""}</td></tr>`,
     )
     .join("")}</tbody></table></div>` : '<p class="empty">Run the pipeline to see the pages it fetched.</p>'}`;
+
+  view.querySelectorAll("input[type=checkbox][data-src]").forEach((el) => (el.onchange = () => updateSource(el.dataset.src, { enabled: el.checked })));
+  view.querySelectorAll("input[data-rule]").forEach((el) => (el.onchange = () => {
+    const value = el.value === "" ? null : Number(el.value);
+    updateSource(el.dataset.src, { [el.dataset.rule]: value });
+  }));
+}
+
+async function updateSource(key, body) {
+  try {
+    const r = await post(`/api/sources/${key}`, body);
+    await refresh();
+    if (target && !target.dirty) target = null; // coverage on the Target tab is recomputed next time it opens
+    await renderSources();
+    if (r.note) toast(r.note);
+    else if ("enabled" in body) toast(`${SOURCE_NAMES[key]} switched ${body.enabled ? "on. The next run reads it." : "off. The next run sets its listings aside."}`);
+    else toast("Saved. The next run uses it.");
+  } catch (e) {
+    toast(e.message);
+    renderSources();
+  }
 }
 
 // ---------------------------------------------------------------- Evals
@@ -428,9 +813,9 @@ function renderEvalsLive() {
   const job = state.job;
   const box = $("#eval-status");
   if (!box) return;
-  if (job.state === "running") box.innerHTML = `<div class="status running"><span class="pulse"></span><span>${esc(job.phase || "Starting the evals…")} · ${job.seconds}s</span></div>`;
-  else if (job.state === "done") renderEvals();
-  else if (job.state === "failed") box.innerHTML = `<div class="status failed">${esc(job.message)}</div>`;
+  // When the eval job finishes, onJob re-renders the whole tab; this only draws the live status.
+  if (job.kind === "eval" && job.state === "running") box.innerHTML = `<div class="status running"><span class="pulse"></span><span>${esc(job.phase || "Starting the evals…")} · ${job.seconds}s</span></div>`;
+  else if (job.kind === "eval" && job.state === "failed") box.innerHTML = `<div class="status failed">${esc(job.message)}</div>`;
   const b = $("#eval-btn");
   if (b) b.disabled = job.state === "running";
 }
@@ -481,7 +866,7 @@ async function route() {
   document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
   await refresh();
   connectStream();
-  ({ run: renderRun, contacts: renderContacts, review: renderReview, sources: renderSources, evals: renderEvals }[tab] ?? renderRun)();
+  ({ target: renderTarget, sources: renderSources, run: renderRun, contacts: renderContacts, review: renderReview, evals: renderEvals }[tab] ?? renderRun)();
 }
 
 function debounce(fn, ms) {

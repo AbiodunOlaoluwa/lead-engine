@@ -13,13 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import db
+from . import icp as icp_mod
+from . import sources as src
 from .enrich import enrich, verify
 from .extract import Extraction, extractor
 from .fetch import FileTransport, Fetcher
 from .match import Rec, candidate_pairs, compare
 from .names import normalise_company, parse_person
 from .parse import parse_portal_page, parse_register_page, profile_text
-from .score import score
+from .score import fits, score
 
 
 ROLE_MAILBOXES = {"info", "hello", "enquiries", "enquiry", "contact", "admin", "office", "sales", "support"}
@@ -53,6 +55,20 @@ class Run:
     on_step: Callable[[str, int, int], None] | None = None  # (stage, done, total), for progress displays
     on_stage: Callable[[str, str], None] | None = None  # (stage, "running" | "done"), reported by the engine itself
     pace_ms: int = 0  # slows each unit of work so a demo can be watched
+    score_pace_ms: int = 0  # a rescore on its own is instant; this lets the demo show it happen
+    icp: dict | None = None  # None: the latest ICP saved in this database
+    icp_version: int | None = None
+    source_config: dict | None = None  # None: this database's source catalog settings
+
+    def _sources(self) -> dict:
+        if self.source_config is None:
+            self.source_config = src.config(self.conn)
+        return self.source_config
+
+    def _icp(self) -> tuple[int | None, dict]:
+        if self.icp is None:
+            self.icp_version, self.icp = icp_mod.current(self.conn)
+        return self.icp_version, self.icp
 
     def _progress(self, stage: str, i: int, total: int, worked: bool = True):
         if self.on_step:
@@ -74,14 +90,44 @@ class Run:
                 self.on_stage(name, "done")
         return summary(self.conn)
 
+    def only(self, name: str) -> dict:
+        """Run one stage on what earlier runs stored, e.g. re-score after the ICP changes, with nothing re-fetched."""
+        steps = {"match": self.match, "score": self.score}
+        if self.on_stage:
+            self.on_stage(name, "running")
+        steps[name]()
+        self.conn.commit()
+        if self.on_stage:
+            self.on_stage(name, "done")
+        return summary(self.conn)
+
     # ---------------------------------------------------------------- source
     def source(self):
-        f = Fetcher(self.conn, FileTransport(self.site, dict(self.flaky)), delay_scale=self.delay_scale)
-        f.get("private/admin.html", "portal")  # robots.txt says no: recorded and skipped
+        cfg = self._sources()
+        on = src.effective(cfg)
+        for key in [s["key"] for s in src.CATALOG if s["key"] not in on]:
+            removed = src.purge(self.conn, key)
+            if removed:
+                db.log(self.conn, "source", f"{src.BY_KEY[key]['name']} is off: set aside its {removed} listings for this run", "warn", key)
+        self.conn.commit()
+        delays = {k: v["crawl_delay"] for k, v in cfg.items() if v["crawl_delay"]}
+        f = Fetcher(self.conn, FileTransport(self.site, dict(self.flaky)), delay_scale=self.delay_scale, source_delays=delays)
+        if "portal" in on:
+            f.get("private/admin.html", "portal")  # robots.txt says no: recorded and skipped
         plan = []
         for source, parser in (("portal", parse_portal_page), ("register", parse_register_page)):
+            if source not in on:
+                continue
             index = f.get(f"{source}/index.html", source) or ""
-            plan += [(source, parser, f"{source}/{href}") for href in re.findall(r'href=["\'](page-\d+\.html)["\']', index)]
+            hrefs = re.findall(r'href=["\'](page-\d+\.html)["\']', index)
+            cap = cfg[source]["max_pages"]
+            if cap and len(hrefs) > cap:
+                db.log(self.conn, "source", f"{source}: max pages is {cap}, so {len(hrefs) - cap} of {len(hrefs)} pages are left unread", "warn", source)
+                hrefs = hrefs[:cap]
+            plan += [(source, parser, f"{source}/{href}") for href in hrefs]
+        profile_cap = cfg["profile"]["max_pages"] if "profile" in on else 0
+        profiles = lambda: self.conn.execute("select count(*) from pages where source = 'profile' and status = 'ok'").fetchone()[0]  # noqa: E731
+        capped = False
         for i, (source, parser, path) in enumerate(plan, 1):
             if db.done(self.conn, path, "parse"):
                 self._progress("source", i, len(plan), worked=False)
@@ -93,34 +139,43 @@ class Run:
             listings, seen = parser(body, path)
             for item in listings:
                 self._insert(item)
-                if item.get("profile_href"):
-                    f.get(f"{source}/{item['profile_href']}", "profile")
+                if item.get("profile_href") and "profile" in on:
+                    target = f"{source}/{item['profile_href']}"
+                    if profile_cap and profiles() >= profile_cap and not self.conn.execute("select 1 from pages where url = ?", (target,)).fetchone():
+                        if not capped:
+                            db.log(self.conn, "source", f"profile: max pages is {profile_cap}, so later profile pages are left unread", "warn", "profile")
+                            capped = True
+                        continue
+                    f.get(target, "profile")
             self.conn.execute(
                 "insert or replace into source_counts (page, source, seen, kept) values (?, ?, ?, ?)", (path, source, seen, len(listings))
             )
             if seen != len(listings):
-                db.log(self.conn, "parse", f"{path}: saw {seen} listings but kept {len(listings)}", "error")
+                db.log(self.conn, "parse", f"{path}: saw {seen} listings but kept {len(listings)}", "error", source)
             db.mark(self.conn, path, "parse")
             self.conn.commit()
             self._progress("source", i, len(plan))
 
     def _insert(self, item: dict):
         person = parse_person(item.get("contact_raw") or "", surname_first=item["source"] == "register")
+        role = {"portal": "agent", "register": "member"}.get(item["source"])
         self.conn.execute(
             """insert into listings (id, source, url, layout, company, company_norm, contact_raw, given, surname, phones, emails,
-                 city, for_rent, short_let, for_sale, services, licensed, extracted_by)
-               values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'parser') on conflict (id) do nothing""",
+                 city, for_rent, short_let, for_sale, services, licensed, role, extracted_by)
+               values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'parser') on conflict (id) do nothing""",
             (
                 item["id"], item["source"], item["url"], item["layout"], item["company"], normalise_company(item["company"]),
                 item.get("contact_raw"), person.given if person else None, person.surname if person else None,
                 json.dumps(item["phones"]), json.dumps(item["emails"]), item.get("city"), item.get("for_rent"),
-                item.get("short_let"), item.get("for_sale"), item.get("services"), item.get("licensed", 0),
+                item.get("short_let"), item.get("for_sale"), item.get("services"), item.get("licensed", 0), role,
             ),
         )
 
     # ---------------------------------------------------------------- extract
     def extract_profiles(self):
         run_extractor = extractor()
+        if "profile" not in src.effective(self._sources()):
+            return  # switched off: its pages were set aside by the source stage
         pages = self.conn.execute("select url, body from pages where source = 'profile' and status = 'ok' order by url").fetchall()
         for i, p in enumerate(pages, 1):
             if db.done(self.conn, p["url"], "extract"):
@@ -132,12 +187,12 @@ class Run:
             lid = "profile-" + Path(p["url"]).stem
             self.conn.execute(
                 """insert into listings (id, source, url, layout, company, company_norm, contact_raw, given, surname, phones, emails,
-                     services, extracted_by, dropped_fields) values (?, 'profile', ?, 'profile', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     services, role, extracted_by, dropped_fields) values (?, 'profile', ?, 'profile', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    on conflict (id) do nothing""",
                 (
                     lid, p["url"], company, normalise_company(company), ex.contact_name, person.given if person else None,
                     person.surname if person else None, json.dumps(ex.phones), json.dumps(ex.emails), ", ".join(ex.services),
-                    ex.model, json.dumps(ex.dropped),
+                    ex.contact_role, ex.model, json.dumps(ex.dropped),
                 ),
             )
             if ex.usage:
@@ -146,7 +201,7 @@ class Run:
                     (lid, ex.model, ex.usage["input_tokens"], ex.usage["output_tokens"], ex.usage["cache_read_tokens"], ex.usage["cost_micros"], db.now()),
                 )
             if ex.dropped:
-                db.log(self.conn, "extract", f"{lid}: dropped {len(ex.dropped)} ungrounded field(s)", "warn")
+                db.log(self.conn, "extract", f"{lid}: dropped {len(ex.dropped)} ungrounded field(s)", "warn", "profile")
             db.mark(self.conn, p["url"], "extract")
             self.conn.commit()
             self._progress("extract", i, len(pages))
@@ -220,14 +275,13 @@ class Run:
         ]
         pairs = candidate_pairs(recs)
         for i, (a, b) in enumerate(pairs, 1):
-            self._progress("match", i, len(pairs), worked=False)
             s, reasons, decision = compare(a, b)
-            if decision == "different":
-                continue
-            self.conn.execute(
-                "insert into matches (a, b, score, reasons, decision) values (?, ?, ?, ?, ?) on conflict (a, b) do nothing",
-                (a.id, b.id, s, json.dumps(reasons), decision),
-            )
+            if decision != "different":
+                self.conn.execute(
+                    "insert into matches (a, b, score, reasons, decision) values (?, ?, ?, ?, ?) on conflict (a, b) do nothing",
+                    (a.id, b.id, s, json.dumps(reasons), decision),
+                )
+            self._progress("match", i, len(pairs), worked=False)  # reported after the work, so the bar never runs ahead
         # Shared identifiers form clusters (one contact, several listings). Fuzzy matches wait for a person.
         parent = {r.id: r.id for r in recs}
 
@@ -258,11 +312,13 @@ class Run:
     # ---------------------------------------------------------------- score
     def score(self):
         # Score the contact, not the listing: "licensed" comes from the register, the rental book from the portal.
+        version, icp = self._icp()
         clusters: dict[str, list[dict]] = {}
         for r in self.conn.execute("select * from listings").fetchall():
             clusters.setdefault(r["cluster_id"] or r["id"], []).append(dict(r))
         for i, members in enumerate(clusters.values(), 1):
-            self._progress("score", i, len(clusters), worked=False)
+            if self.score_pace_ms:
+                time.sleep(self.score_pace_ms / 1000)
             portal = [m for m in members if m["source"] == "portal"] or members
             combined = {
                 "company": portal[0]["company"],
@@ -271,12 +327,19 @@ class Run:
                 "short_let": max((m["short_let"] or 0) for m in members),
                 "for_sale": max((m["for_sale"] or 0) for m in members),
                 "services": " ".join(m["services"] or "" for m in members),
+                "cities": sorted({m["city"] for m in members if m["city"]}),
+                "roles": sorted({m["role"] for m in members if m["role"]}),
+                "has_email": any(m["email_status"] == "deliverable" for m in members),
+                "has_phone": any(json.loads(m["phones"]) for m in members),
             }
-            points, tier, parts = score(combined)
+            points, tier, parts = score(combined, icp)
+            fit = int(fits(parts))
             for m in members:
                 self.conn.execute(
-                    "update listings set score = ?, tier = ?, score_breakdown = ? where id = ?", (points, tier, json.dumps(parts), m["id"])
+                    "update listings set score = ?, tier = ?, score_breakdown = ?, icp_fit = ?, icp_version = ? where id = ?",
+                    (points, tier, json.dumps(parts), fit, version, m["id"]),
                 )
+            self._progress("score", i, len(clusters), worked=False)  # after the work, so the bar never runs ahead
         self.conn.commit()
 
 
@@ -297,6 +360,7 @@ def summary(conn: sqlite3.Connection) -> dict:
             "select count(*) from matches m left join review_decisions d on d.a = m.a and d.b = m.b where m.decision = 'review' and d.a is null"
         ),
         "tier1": one("select count(distinct cluster_id) from listings where tier = 1"),
+        "outside_icp": one("select count(distinct cluster_id) from listings where icp_fit = 0"),
         "dropped_fields": one("select coalesce(sum(json_array_length(dropped_fields)), 0) from listings"),
         "llm_cost_micros": one("select coalesce(sum(cost_micros), 0) from llm_calls"),
     }

@@ -22,12 +22,17 @@ class Extraction:
     emails: list[str] = field(default_factory=list)
     services: list[str] = field(default_factory=list)
     dropped: list[dict] = field(default_factory=list)  # fields that failed grounding, with why
+    contact_role: str | None = None  # "principal" when the name's own quote says they run the firm
     model: str = "scripted"
     usage: dict = field(default_factory=dict)
 
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().lower()
+
+
+# A role is only read from the quote that named the person, so "office manager, Ifeoma Nnadi" is not a principal.
+PRINCIPAL_CUE = re.compile(r"principal|managing (?:partner|director)|founder|owner|\bceo\b|led by|leads", re.I)
 
 
 def ground(raw: dict, text: str, model: str, usage: dict | None = None) -> Extraction:
@@ -50,6 +55,7 @@ def ground(raw: dict, text: str, model: str, usage: dict | None = None) -> Extra
         tokens = [t for t in fold(value).split() if t not in HONORIFICS and len(t) > 1]
         if tokens and all(t in fold(quote).split() for t in tokens):
             out.contact_name = value
+            out.contact_role = "principal" if PRINCIPAL_CUE.search(quote) else None
         else:
             out.dropped.append({"field": "contact_name", "value": value, "why": "name not in its quote"})
     for item in raw.get("phones") or []:
@@ -139,6 +145,19 @@ SCHEMA = {
 PRICES = {"claude-opus-5": (5, 25), "claude-opus-5-5": (4, 20), "claude-sonnet-5": (2, 10), "claude-haiku-4-5": (1, 5)}
 
 
+def usage_of(u, model: str) -> dict:
+    """Tokens and cost in micro-dollars for one call, cache reads and writes priced separately."""
+    pin, pout = PRICES.get(model, PRICES["claude-opus-5"])
+    cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+    return {
+        "input_tokens": u.input_tokens + cache_read + cache_write,
+        "output_tokens": u.output_tokens,
+        "cache_read_tokens": cache_read,
+        "cost_micros": round(u.input_tokens * pin + cache_write * pin * 1.25 + cache_read * pin * 0.1 + u.output_tokens * pout),
+    }
+
+
 def extract_claude(text: str, model: str | None = None) -> Extraction:
     import anthropic
 
@@ -153,16 +172,7 @@ def extract_claude(text: str, model: str | None = None) -> Extraction:
         messages=[{"role": "user", "content": f"Page text:\n\n{text}"}],
         output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
     )
-    u = response.usage
-    pin, pout = PRICES.get(model, PRICES["claude-opus-5"])
-    cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
-    cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
-    usage = {
-        "input_tokens": u.input_tokens + cache_read + cache_write,
-        "output_tokens": u.output_tokens,
-        "cache_read_tokens": cache_read,
-        "cost_micros": round(u.input_tokens * pin + cache_write * pin * 1.25 + cache_read * pin * 0.1 + u.output_tokens * pout),
-    }
+    usage = usage_of(response.usage, model)
     if response.stop_reason == "refusal":
         return Extraction(model=model, usage=usage, dropped=[{"field": "*", "value": "", "why": "model declined"}])
     body = next((b.text for b in response.content if b.type == "text"), "{}")

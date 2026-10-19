@@ -7,6 +7,7 @@ import sqlite3
 from html import escape as e
 from pathlib import Path
 
+from . import icp as icp_mod
 from .pipeline import summary
 
 CSS = """
@@ -53,6 +54,7 @@ def write_report(conn: sqlite3.Connection, site: Path, out: Path) -> Path:
         (s["contacts"], "contacts after matching", ""),
         (s["review_pairs"], "pairs waiting for review", "held"),
         (s["tier1"], "tier 1 contacts", "ok"),
+        (s["outside_icp"], "outside the ICP", ""),
     ]
     html_tiles = "".join(f'<div class="tile {c}"><b>{v}</b><span>{e(l)}</span></div>' for v, l, c in tiles)
 
@@ -90,10 +92,15 @@ def write_report(conn: sqlite3.Connection, site: Path, out: Path) -> Path:
         for l in links
     )
     pts = best[0]
+    def mark(p: dict) -> str:
+        return "&#10005;" if p.get("kind") == "outside" else "&#10003;" if p.get("kind") == "must" else f"{'+' if p['points'] > 0 else ''}{p['points']}"
+
     breakdown = "".join(
-        f"<tr><td class='pts {'neg' if p['points'] < 0 else ''}'>{'+' if p['points'] > 0 else ''}{p['points']}</td><td>{e(p['why'])}</td></tr>"
+        f"<tr><td class='pts {'neg' if p['points'] < 0 or p.get('kind') == 'outside' else ''}'>{mark(p)}</td><td>{e(p['why'])}"
+        f"{''.join(f'<div class=note>ICP: &ldquo;{e(x)}&rdquo;</div>' for x in p.get('evidence') or [])}</td></tr>"
         for p in json.loads(pts["score_breakdown"] or "[]")
     )
+    version, icp = icp_mod.current(conn)
 
     review = conn.execute("select * from matches where decision = 'review' order by score desc").fetchall()
     names = {r["id"]: r for r in rows}
@@ -104,7 +111,7 @@ def write_report(conn: sqlite3.Connection, site: Path, out: Path) -> Path:
         for r in review[:12]
     )
 
-    top = sorted(by_cluster.values(), key=lambda ms: -(ms[0]["score"] or 0))[:10]
+    top = sorted(by_cluster.values(), key=lambda ms: (ms[0]["icp_fit"] == 0, -(ms[0]["score"] or 0)))[:10]
     top_rows = "".join(
         f"<tr><td>{e(next((m['company'] for m in ms if m['source'] == 'portal'), ms[0]['company']))}</td><td>{len(ms)}</td>"
         f"<td class='pts'>{ms[0]['score']}</td><td>{chip('tier ' + str(ms[0]['tier']), 'c-ok' if ms[0]['tier'] == 1 else 'c-held' if ms[0]['tier'] == 2 else 'c-info')}</td>"
@@ -135,6 +142,7 @@ def write_report(conn: sqlite3.Connection, site: Path, out: Path) -> Path:
 <div class="scroll"><table><tr><th>Listing A</th><th>Listing B</th><th>Score</th><th>Why</th></tr>{review_rows}</table></div>
 
 <h2>Top contacts</h2>
+<p class="muted">Scored with ICP version {version}: &ldquo;{e(icp['description'])}&rdquo;</p>
 <div class="scroll"><table><tr><th>Firm</th><th>Listings</th><th>Points</th><th>Tier</th><th>Breakdown</th></tr>{top_rows}</table></div>
 
 <h2>Every page: listings shown versus kept</h2>

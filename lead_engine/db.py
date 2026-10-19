@@ -37,7 +37,10 @@ create table if not exists listings (
   enrichment_trail text not null default '[]',
   score int, tier int, score_breakdown text,
   cluster_id text,
-  review_status text not null default 'ready'   -- ready | needs_review | excluded
+  review_status text not null default 'ready',  -- ready | needs_review | excluded
+  role text,                     -- agent (portal contact) | member (register) | principal (named as running the firm)
+  icp_fit int,                   -- 1 inside the ICP, 0 fails one of its must-haves
+  icp_version int                -- the ICP version that scored it
 );
 create table if not exists matches (
   a text not null, b text not null,
@@ -61,14 +64,31 @@ create table if not exists llm_calls (
   id integer primary key, listing_id text, model text, input_tokens int, output_tokens int,
   cache_read_tokens int, cost_micros int, at text
 );
-create table if not exists events (id integer primary key, stage text, level text, message text, at text);
+create table if not exists events (id integer primary key, stage text, level text, message text, at text, source text);
 create table if not exists review_decisions (
   a text not null, b text not null,
   decision text not null,        -- merge | keep_apart
   at text not null,
   primary key (a, b)
 );
+create table if not exists icp_versions (
+  version integer primary key autoincrement,
+  description text not null,
+  parser text not null,
+  icp text not null,             -- JSON: the criteria, their evidence and points
+  created_at text not null
+);
+create table if not exists source_config (
+  key text primary key,
+  enabled int not null default 1,
+  crawl_delay real,              -- seconds; never below what robots.txt asks for
+  max_pages int,                 -- null: no limit
+  updated_at text
+);
 """
+
+# Columns added after the first release, so an existing database upgrades in place.
+MIGRATIONS = {"listings": ("role text", "icp_fit int", "icp_version int"), "events": ("source text",)}
 
 
 def now() -> str:
@@ -83,6 +103,11 @@ def connect(path: Path | str) -> sqlite3.Connection:
     if str(path) != ":memory:":
         conn.execute("pragma journal_mode = wal")  # the web app reads while a run writes
     conn.executescript(SCHEMA)
+    for table, columns in MIGRATIONS.items():
+        have = {r[1] for r in conn.execute(f"pragma table_info({table})")}
+        for col in columns:
+            if col.split()[0] not in have:
+                conn.execute(f"alter table {table} add column {col}")
     return conn
 
 
@@ -103,8 +128,9 @@ def set_listener(fn) -> None:
     _listener = fn
 
 
-def log(conn: sqlite3.Connection, stage: str, message: str, level: str = "info") -> None:
-    conn.execute("insert into events (stage, level, message, at) values (?, ?, ?, ?)", (stage, level, message, now()))
+def log(conn: sqlite3.Connection, stage: str, message: str, level: str = "info", source: str | None = None) -> None:
+    """source names the catalog source an event belongs to, so the Sources tab can show each one's last problem."""
+    conn.execute("insert into events (stage, level, message, at, source) values (?, ?, ?, ?, ?)", (stage, level, message, now(), source))
     if _listener:
         _listener(stage, level, message)
 

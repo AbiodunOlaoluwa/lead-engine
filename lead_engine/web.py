@@ -35,6 +35,25 @@ class Decision(BaseModel):
     decision: str
 
 
+class RescoreBody(BaseModel):
+    pace: str = "watch"  # watch | fast
+
+
+class Description(BaseModel):
+    description: str = Field(min_length=1, max_length=2000)
+
+
+class IcpBody(BaseModel):
+    icp: dict
+
+
+class SourceBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    enabled: bool | None = None
+    crawl_delay: float | None = Field(default=None, ge=0, le=60)
+    max_pages: int | None = Field(default=None, ge=1, le=10000)
+
+
 def _start(kind: str, fn):
     if not svc.JOBS.start(kind, fn):
         raise HTTPException(409, "Something is already running. Wait for it to finish.")
@@ -70,13 +89,28 @@ async def job_stream(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
 
 
+def _not_blocked():
+    reason = svc.run_blocked()
+    if reason:
+        raise HTTPException(409, reason)
+
+
 @app.post("/api/jobs/run")
 def run(body: RunBody):
+    _not_blocked()
     return _start("run", svc.run_job(body.stop_after, 30 if body.pace == "watch" else 0, body.fresh))
+
+
+@app.post("/api/jobs/rescore")
+def rescore(body: RescoreBody):
+    if not svc.state()["has_run"]:
+        raise HTTPException(409, "Nothing to rescore yet. Run the pipeline first.")
+    return _start("rescore", svc.rescore_job(30 if body.pace == "watch" else 0))
 
 
 @app.post("/api/jobs/drill")
 def drill():
+    _not_blocked()
     return _start("drill", svc.drill_job)
 
 
@@ -96,6 +130,51 @@ def reset():
         raise HTTPException(409, "Something is running.")
     svc.reset_db()
     return {"ok": True}
+
+
+@app.get("/api/icp")
+def icp():
+    return svc.icp_state(svc.conn())
+
+
+@app.post("/api/icp/parse")
+def icp_parse(body: Description):
+    return svc.parse_icp(svc.conn(), body.description)
+
+
+@app.post("/api/icp/coverage")
+def icp_coverage(body: IcpBody):
+    return svc.coverage_for(svc.conn(), body.icp)
+
+
+@app.post("/api/icp")
+def icp_save(body: IcpBody):
+    return svc.save_icp(svc.conn(), body.icp)
+
+
+@app.get("/api/icp/versions/{version}")
+def icp_version(version: int):
+    from .icp import get_version
+
+    found = get_version(svc.conn(), version)
+    if not found:
+        raise HTTPException(404, "No such ICP version.")
+    return {"version": version, "icp": found}
+
+
+@app.get("/api/sources")
+def sources():
+    return svc.sources_state(svc.conn())
+
+
+@app.post("/api/sources/{key}")
+def source_update(key: str, body: SourceBody):
+    if svc.JOBS.busy():
+        raise HTTPException(409, "A run is in progress. Change sources when it has finished.")
+    try:
+        return svc.update_source(svc.conn(), key, body.model_dump(exclude_unset=True))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.get("/api/contacts")
@@ -138,11 +217,14 @@ def events(limit: int = 40):
 
 @app.get("/api/export.csv")
 def export():
-    text, ready, held = svc.export_csv(svc.conn())
+    text, ready, held, outside = svc.export_csv(svc.conn())
     return Response(
         text,
         media_type="text/csv",
-        headers={"content-disposition": 'attachment; filename="lead-engine-contacts.csv"', "x-held-for-review": str(held), "x-exported": str(ready)},
+        headers={
+            "content-disposition": 'attachment; filename="lead-engine-contacts.csv"',
+            "x-held-for-review": str(held), "x-outside-icp": str(outside), "x-exported": str(ready),
+        },
     )
 
 

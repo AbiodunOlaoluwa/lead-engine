@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import db
+from . import icp as icp_mod
+from . import sources as src
 from .directory import generate
 from .names import parse_person
 from .pipeline import STAGES, Budget, Interrupted, Run, summary
@@ -146,6 +148,14 @@ class Jobs:
             self.job.events = self.job.events[-60:]
             self._bump()
 
+    def keep_others(self, stage: str):
+        """For a one-stage job (a rescore): every other stage keeps what the last run stored, and says so."""
+        with self.cond:
+            for name, st in self.job.stages.items():
+                if name != stage:
+                    st["state"] = "kept"
+            self._bump()
+
     def set_phase(self, text: str):
         with self.cond:
             self.job.phase = text
@@ -173,6 +183,42 @@ def ensure_site():
         generate(SITE)
 
 
+def run_blocked() -> str | None:
+    return src.blocked(src.config(conn()))
+
+
+def _tiers(c: sqlite3.Connection) -> dict:
+    rows = c.execute("select cluster_id, min(tier) as tier, min(icp_fit) as fit from listings group by cluster_id").fetchall()
+    return {
+        "tier1": sum(1 for r in rows if r["tier"] == 1),
+        "tier2": sum(1 for r in rows if r["tier"] == 2),
+        "tier3": sum(1 for r in rows if r["tier"] == 3),
+        "outside": sum(1 for r in rows if r["fit"] == 0),
+    }
+
+
+def rescore_job(pace_ms: int):
+    """Re-score every contact with the current ICP. Only the score stage runs: nothing is fetched or looked up."""
+
+    def fn(jobs: Jobs):
+        c = db.connect(DB_PATH)
+        version, _ = icp_mod.current(c)
+        before = _tiers(c)
+        jobs.keep_others("score")
+        jobs.set_phase(f"Scoring with ICP version {version}. Every other stage keeps what the last run stored.")
+        result = Run(c, SITE, on_step=jobs.step, on_stage=jobs.stage, score_pace_ms=pace_ms).only("score")
+        after = _tiers(c)
+        result = result | {"rescore": {"version": version, "before": before, "after": after}}
+        jobs.set_phase("")
+        jobs.done(
+            f"Rescored with ICP version {version}. Tier 1: {before['tier1']} to {after['tier1']}. "
+            f"Outside the ICP: {before['outside']} to {after['outside']}. Nothing was fetched or looked up.",
+            result,
+        )
+
+    return fn
+
+
 def run_job(stop_after: int | None, pace_ms: int, fresh: bool):
     def fn(jobs: Jobs):
         ensure_site()
@@ -189,6 +235,9 @@ def run_job(stop_after: int | None, pace_ms: int, fresh: bool):
 def drill_job(jobs: Jobs):
     """Crash a run three times, resume it, and compare with a clean run, on a scratch database."""
     ensure_site()
+    main = conn()
+    version, icp = icp_mod.current(main)
+    settings = {"icp": icp, "icp_version": version, "source_config": src.config(main)}  # the drill uses the same targeting
     scratch = DATA / "drill.db"
     for p in (scratch, Path(str(scratch) + "-wal"), Path(str(scratch) + "-shm")):
         p.unlink(missing_ok=True)
@@ -199,7 +248,7 @@ def drill_job(jobs: Jobs):
         jobs.reset_stages()
         jobs.set_phase(f"Attempt {n} of {len(plan) + 1}: will crash after {stop_after} steps")
         try:
-            Run(conn, SITE, Budget(stop_after), on_step=jobs.step, on_stage=jobs.stage, pace_ms=8).all()
+            Run(conn, SITE, Budget(stop_after), on_step=jobs.step, on_stage=jobs.stage, pace_ms=8, **settings).all()
             break
         except Interrupted:
             stops.append(stop_after)
@@ -207,9 +256,9 @@ def drill_job(jobs: Jobs):
             conn.commit()
     jobs.reset_stages()
     jobs.set_phase(f"Attempt {len(plan) + 1} of {len(plan) + 1}: resume and finish")
-    final = Run(conn, SITE, on_step=jobs.step, on_stage=jobs.stage, pace_ms=8).all()
+    final = Run(conn, SITE, on_step=jobs.step, on_stage=jobs.stage, pace_ms=8, **settings).all()
     jobs.set_phase("Comparing with a run that never stopped")
-    clean = Run(db.connect(":memory:"), SITE).all()
+    clean = Run(db.connect(":memory:"), SITE, **settings).all()
     one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
     checks = {
         "listings": one("select count(*) from listings"),
@@ -245,9 +294,18 @@ def generate_job(size: int, seed: int):
     return fn
 
 
+RESULT_TABLES = ("pages", "listings", "matches", "ledger", "source_counts", "quarantined_domains", "llm_calls", "events", "review_decisions")
+
+
 def reset_db():
-    for p in (DB_PATH, Path(str(DB_PATH) + "-wal"), Path(str(DB_PATH) + "-shm")):
-        p.unlink(missing_ok=True)
+    """Clear the results. The ICP versions and the source settings are yours, so they stay."""
+    if not DB_PATH.exists():
+        return
+    c = db.connect(DB_PATH)
+    for table in RESULT_TABLES:
+        c.execute(f"delete from {table}")
+    c.commit()
+    c.close()
 
 
 # ---------------------------------------------------------------- queries
@@ -295,11 +353,12 @@ def contacts(c: sqlite3.Connection, q: str = "") -> list[dict]:
             "sources": sorted({m["source"] for m in ms}),
             "listings": len(ms),
             "needs_review": any(m["review_status"] == "needs_review" for m in ms),
+            "outside_icp": any(m["icp_fit"] == 0 for m in ms),
         }
         if q and q.lower() not in f"{row['name']} {row['firm']} {row['city']}".lower():
             continue
         rows.append(row)
-    return sorted(rows, key=lambda r: (-(r["score"] or 0), r["firm"]))
+    return sorted(rows, key=lambda r: (r["outside_icp"], -(r["score"] or 0), r["firm"]))  # inside the ICP first
 
 
 def contact_detail(c: sqlite3.Connection, cid: str) -> dict | None:
@@ -324,6 +383,7 @@ def contact_detail(c: sqlite3.Connection, cid: str) -> dict | None:
     return {
         "id": cid, "name": display_name(ms), "score": ms[0]["score"], "tier": ms[0]["tier"],
         "breakdown": json.loads(ms[0]["score_breakdown"] or "[]"), "listings": listings, "links": links,
+        "icp_version": ms[0]["icp_version"], "outside_icp": ms[0]["icp_fit"] == 0,
     }
 
 
@@ -365,16 +425,19 @@ def decide(c: sqlite3.Connection, a: str, b: str, decision: str) -> dict:
     return summary(c)
 
 
-def export_csv(c: sqlite3.Connection) -> tuple[str, int, int]:
-    """One row per contact. Contacts still waiting for review are held back, the way a CRM import should be."""
+def export_csv(c: sqlite3.Connection) -> tuple[str, int, int, int]:
+    """One row per contact. Contacts still waiting for review are held back, the way a CRM import should be, and so
+    are contacts outside the ICP. Returns (csv, exported, held for review, outside the ICP)."""
     rows = contacts(c)
-    ready = [r for r in rows if not r["needs_review"]]
+    ready = [r for r in rows if not r["needs_review"] and not r["outside_icp"]]
+    held = sum(1 for r in rows if r["needs_review"])
+    outside = sum(1 for r in rows if r["outside_icp"] and not r["needs_review"])
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["name", "firm", "city", "phones", "email", "email_status", "tier", "score", "sources", "listings"])
     for r in ready:
         w.writerow([r["name"], r["firm"], r["city"], " ".join(r["phones"]), r["email"] or "", r["email_status"] or "", r["tier"], r["score"], " ".join(r["sources"]), r["listings"]])
-    return buf.getvalue(), len(ready), len(rows) - len(ready)
+    return buf.getvalue(), len(ready), held, outside
 
 
 def pages(c: sqlite3.Connection) -> list[dict]:
@@ -394,15 +457,107 @@ def events(c: sqlite3.Connection, limit: int = 40) -> list[dict]:
 def state() -> dict:
     c = conn()
     s = summary(c)
-    ready = sum(1 for r in contacts(c) if not r["needs_review"]) if s["listings"] else 0
-    import os
-
+    ready = sum(1 for r in contacts(c) if not r["needs_review"] and not r["outside_icp"]) if s["listings"] else 0
+    version, icp = icp_mod.current(c)
+    scored_with = c.execute("select max(icp_version) from listings").fetchone()[0]
     return {
         "summary": s,
         "ready_to_export": ready,
         "site": site_info(),
         "job": JOBS.snapshot(),
-        "mode": "claude" if os.environ.get("LEAD_ENGINE_MODE") == "anthropic" and os.environ.get("ANTHROPIC_API_KEY") else "regex baseline",
+        "mode": "claude" if icp_mod.claude_on() else "regex baseline",
         "has_run": s["listings"] > 0,
         "evals": json.loads(EVAL_RESULTS.read_text()) if EVAL_RESULTS.exists() else None,
+        "icp": {"version": version, "description": icp["description"], "scored_with": scored_with},
+        "blocked": src.blocked(src.config(c)),
     }
+
+
+# ---------------------------------------------------------------- targeting: ICP and sources
+
+def _coverage(c: sqlite3.Connection, icp: dict) -> dict:
+    return src.coverage(src.config(c), icp_mod.needs(icp), icp.get("unsupported"))
+
+
+def icp_state(c: sqlite3.Connection) -> dict:
+    version, icp = icp_mod.current(c)
+    scored_with = c.execute("select max(icp_version) from listings").fetchone()[0]
+    return {
+        "version": version,
+        "icp": icp,
+        "versions": icp_mod.versions(c),
+        "coverage": _coverage(c, icp),
+        "scored_with": scored_with,
+        "parser": "claude" if icp_mod.claude_on() else "baseline",
+        "examples": icp_mod.EXAMPLES,
+        "labels": icp_mod.LABELS,
+        "order": list(icp_mod.ORDER),
+        "vocab": {"cities": list(icp_mod.CITIES), "firm_types": list(icp_mod.FIRM_TYPES), "roles": list(icp_mod.ROLES), "channels": list(icp_mod.CHANNELS)},
+    }
+
+
+def parse_icp(c: sqlite3.Connection, description: str) -> dict:
+    """Read a description into a draft ICP. Nothing is saved until you press Save."""
+    draft, usage = icp_mod.parse(description)
+    if usage:
+        c.execute(
+            "insert into llm_calls (listing_id, model, input_tokens, output_tokens, cache_read_tokens, cost_micros, at) values (?,?,?,?,?,?,?)",
+            ("icp", draft["parser"], usage["input_tokens"], usage["output_tokens"], usage["cache_read_tokens"], usage["cost_micros"], db.now()),
+        )
+        c.commit()
+    return {"icp": draft, "coverage": _coverage(c, draft), "cost_micros": (usage or {}).get("cost_micros", 0)}
+
+
+def save_icp(c: sqlite3.Connection, data: dict) -> dict:
+    version = icp_mod.save(c, data)
+    db.log(c, "icp", f"Saved ICP version {version}")
+    c.commit()
+    return icp_state(c)
+
+
+def coverage_for(c: sqlite3.Connection, data: dict) -> dict:
+    return _coverage(c, icp_mod.normalise(data))
+
+
+def sources_state(c: sqlite3.Connection) -> dict:
+    cfg = src.config(c)
+    rb = src.robots(SITE)
+    on = src.effective(cfg)
+    hl = src.health(c)
+    _, icp = icp_mod.current(c)
+    cov = _coverage(c, icp)
+    needed = {cap for row in cov["rows"] for cap in row["caps"]}
+    items = []
+    for s in src.CATALOG:
+        k = s["key"]
+        items.append(
+            {
+                **{x: s[x] for x in ("key", "name", "what", "index")},
+                "requires": s.get("requires"),
+                "enabled": cfg[k]["enabled"],
+                "reading": k in on,
+                "crawl_delay": cfg[k]["crawl_delay"],
+                "max_pages": cfg[k]["max_pages"],
+                "robots_allowed": rb["allowed"][k],
+                "capabilities": [
+                    {"key": cap, "label": src.CAPABILITIES[cap], "needed": cap in needed, "partial": s["partial"].get(cap)} for cap in s["provides"]
+                ],
+                "health": hl[k],
+            }
+        )
+    return {
+        "sources": items,
+        "robots": {"crawl_delay": rb["crawl_delay"], "disallowed": rb["disallowed"], "text": rb["text"]},
+        "coverage": cov,
+        "icp_version": icp_mod.current(c)[0],
+    }
+
+
+def update_source(c: sqlite3.Connection, key: str, body: dict) -> dict:
+    clear = tuple(k for k in ("crawl_delay", "max_pages") if k in body and body[k] is None)
+    res = src.update(c, key, SITE, enabled=body.get("enabled"), crawl_delay=body.get("crawl_delay"), max_pages=body.get("max_pages"), clear=clear)
+    if "enabled" in body:
+        name = src.BY_KEY[key]["name"]
+        db.log(c, "source", f"{name} switched {'on' if body['enabled'] else 'off'}. The next run {'reads it' if body['enabled'] else 'sets it aside'}.", source=key)
+        c.commit()
+    return sources_state(c) | {"note": res["note"]}

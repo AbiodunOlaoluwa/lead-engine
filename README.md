@@ -15,11 +15,32 @@ uv sync --extra llm --group dev
 uv run python -m lead_engine serve        # http://127.0.0.1:8040
 ```
 
-Every command is a button: run the pipeline (watchable or fast), crash it at a chosen step and resume, run the crash drill, decide the review queue, export the contacts, open the raw directory pages, and run the evals. Progress is pushed from the engine as it works (server-sent events), so a stage only turns green when the engine says it finished, and warnings appear on the stage that hit them.
+The tabs follow the work: **Target** (who the list is for), **Sources** (what the engine reads), **Run**, **Contacts**, **Review** and **Evals**. Every command is a button: describe your ideal customer and rescore, switch sources on and off, run the pipeline (watchable or fast), crash it at a chosen step and resume, run the crash drill, decide the review queue, export the contacts, open the raw directory pages, and run the evals. Progress is pushed from the engine as it works (server-sent events), so a stage only turns green when the engine says it finished, and warnings appear on the stage that hit them.
 
 | Contacts, with each one's full trail | Review queue: the engine never merges on a name alone |
 | --- | --- |
 | ![Contacts](docs/app-contacts.png) | ![Review](docs/app-review.png) |
+
+## Targeting: ICP and sources
+
+![Target: a plain-English ICP read into criteria, each quoting the words it came from](docs/app-target.png)
+
+**Describe the customer in plain English.** "Property management firms in Lagos with at least 10 homes for rent, ideally on the professional register. Reachable by email." A parser reads it into criteria: kind of firm, city, rental-book range, short-lets, register membership, who the contact is, how they can be reached, and what to leave out. Two parsers share one contract, the same one extraction uses:
+
+- Every criterion carries the exact phrase of the description it came from, and the server checks the phrase is really there and really says that. "Lagos" with no "Lagos" in the text is dropped and listed, never guessed.
+- Whether a criterion is a must-have is read from its sentence too: "Must be on the register" is a must, "ideally on the register" earns points, "Skip firms that are mostly sales" leaves them out.
+- Anything the description asks for that no source can give ("a team of 10 or more") is reported as unsupported instead of being quietly mapped onto something else.
+- The baseline parser knows this directory's vocabulary and needs no key. With `LEAD_ENGINE_MODE=anthropic` and a key, Claude reads it with a JSON schema; its output goes through the same check.
+
+The parsed ICP is a form you can edit: switch criteria on or off, change points, make one a must-have. Saving creates a new version, and the built-in version 1 reproduces the original scoring exactly (a test holds it to that). **Rescore** re-runs only the score stage with the saved version, through the same engine-reported progress as a full run: nothing is fetched or looked up again. Every line of a contact's breakdown names the criterion, its points and the ICP's words, and a contact that fails a must-have is marked outside the ICP, drops to tier 3 and is held back from the export.
+
+![Sources: the catalog, with switches, crawl rules, what each source can give, and how it behaved](docs/app-sources.png)
+
+**Sources are a catalog, not a search box.** Each source (the portal, the register, the profile pages) has an on/off switch, rules (a crawl delay that can't go below robots.txt, a page limit), the robots.txt verdict, the fields it can provide, and its health from the last run: pages fetched, failed and retried, listings shown against kept, and its latest problem. A switched-off source is set aside on the next run and never fetched; switch it back on and it is read again from scratch.
+
+The ICP is checked against the catalog. If a criterion needs something only a switched-off source provides, the app says so ("Your ICP needs register membership, but the Professional register is off. Turn it on or drop the criterion.") and ranks the sources by how much of the ICP each covers. Gaps warn; they never block, with one exception: if no source that is on gives a phone number or an email, Run is disabled and says why.
+
+**There is no open-web scraping, on purpose.** Every field has to be grounded in a page the engine can show you; each source's robots.txt and terms are checked before it joins the catalog; and a known layout is what makes the shown-versus-kept check, surname-first parsing and cross-source de-duplication possible. Adding a source means adding a parser to the catalog, with its layouts, rules and tests.
 
 ## The pipeline
 
@@ -31,7 +52,7 @@ Every command is a button: run the pipeline (watchable or fast), crash it at a c
 | **Enrich** | Three providers in order, each with a recorded result | Guessing: if nobody finds an email, the field stays empty |
 | **Verify** | Every address checked; catch-all domains flagged and quarantined | "Verified" addresses that bounce later |
 | **Match** | Shared phone or personal email links automatically; similar names go to review | Wrong merges, and the same person messaged twice under two numbers |
-| **Score** | Points anyone can read, per contact rather than per listing | "Why is this lead at the top?" having no answer |
+| **Score** | Points set by the ICP, per contact rather than per listing, each line quoting the ICP's words | "Why is this lead at the top?" having no answer |
 
 Every stage writes to a ledger as it finishes each record. Stop the run anywhere and start it again: nothing is fetched, created or looked up twice. `python -m lead_engine drill` proves it by stopping three times and comparing the result with an uninterrupted run.
 
@@ -83,10 +104,10 @@ There is also a static report of the latest run: `uv run python -m lead_engine r
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LEAD_ENGINE_MODE` | regex baseline | `anthropic` to extract with Claude |
+| `LEAD_ENGINE_MODE` | regex baseline | `anthropic` to extract and read ICPs with Claude |
 | `LEAD_ENGINE_MODEL` | `claude-opus-5` | Any current Claude model id |
 
-Claude calls use a JSON schema, low effort, a cached system prompt, and Anthropic's server-side refusal fallback. Token use and cost are recorded per call.
+Claude calls (extraction and ICP reading) use a JSON schema, low effort, a cached system prompt, and Anthropic's server-side refusal fallback. Token use and cost are recorded per call.
 
 All firms, people, phone numbers (an unassigned 0800 555 range) and `.example` domains are fictional.
 
