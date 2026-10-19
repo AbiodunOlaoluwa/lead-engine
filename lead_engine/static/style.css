@@ -1,4 +1,4 @@
-/* Lead Engine: the Rexara Digital system. White, one deep green; amber = waiting for a person, red = blocked or failed. */
+/* Lead Engine design system. White, one deep green; amber = waiting for a person, red = blocked or failed. */
 :root {
   color-scheme: light;
   --bg: #ffffff; --tint: #f6f7f4; --sunk: #eff1ec;
