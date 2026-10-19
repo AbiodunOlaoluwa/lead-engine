@@ -2,6 +2,8 @@
 
 [![test](https://github.com/AbiodunOlaoluwa/lead-engine/actions/workflows/test.yml/badge.svg)](https://github.com/AbiodunOlaoluwa/lead-engine/actions/workflows/test.yml)
 
+**Try it live: https://lead-engine-yqxv.onrender.com** (free hosting: the first visit after a quiet spell takes up to a minute to wake).
+
 Turns messy public directories into a clean, de-duplicated, scored list of business contacts. It extracts with an LLM where pages are free text, keeps only what it can ground in the page, and is measured with evals.
 
 This is a rebuild, on generated fictional data, of the pipeline that sourced Rentyx's sales list: 11,000+ contacts from Nigerian property portals and professional registers. Every rule in it came from something that went wrong on the real data.
