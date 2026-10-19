@@ -1,0 +1,13 @@
+# Render blueprint: one free web service. The fictional directory is generated on first start;
+# the regex extractor needs no API key (set LEAD_ENGINE_MODE=anthropic and ANTHROPIC_API_KEY to extract with Claude).
+services:
+  - type: web
+    name: lead-engine
+    runtime: python
+    plan: free
+    buildCommand: pip install uv && uv sync --frozen --no-dev
+    startCommand: uv run --no-dev python -m lead_engine serve --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/state
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"

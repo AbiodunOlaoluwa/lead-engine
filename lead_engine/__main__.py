@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -92,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("report")
     sub.add_parser("eval")
     sv = sub.add_parser("serve")
-    sv.add_argument("--port", type=int, default=8040)
+    sv.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    sv.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8040")))
     args = ap.parse_args(argv)
 
     if args.cmd == "generate":
@@ -114,8 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "serve":
         import uvicorn
 
-        print(f"Lead Engine is running at http://127.0.0.1:{args.port}")
-        uvicorn.run("lead_engine.web:app", host="127.0.0.1", port=args.port, log_level="warning")
+        print(f"Lead Engine is running at http://{args.host}:{args.port}")
+        uvicorn.run("lead_engine.web:app", host=args.host, port=args.port, log_level="warning")
         return 0
     if args.cmd == "eval":
         from evals.run_evals import main as run_evals
