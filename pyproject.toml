@@ -1,0 +1,20 @@
+[project]
+name = "lead-engine"
+version = "0.1.0"
+description = "Source, extract, enrich, verify, match and score business leads from messy public directories. Grounded LLM extraction, measured with evals."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["beautifulsoup4>=4.12"]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.80"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

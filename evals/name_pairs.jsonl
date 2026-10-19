@@ -1,0 +1,24 @@
+{"a": "Funmi Adeyemi", "b": "ADEYEMI OLUFUNMILAYO OLUWASEUN", "b_surname_first": true, "same": true, "why": "short form + surname first"}
+{"a": "Tunde Bello", "b": "BELLO BABATUNDE", "b_surname_first": true, "same": true, "why": "short form"}
+{"a": "ESV Toyin Okafor", "b": "OKAFOR OLUWATOYIN ADEOLA", "b_surname_first": true, "same": true, "why": "honorific + short form"}
+{"a": "Emeka Nwosu", "b": "NWOSU CHUKWUEMEKA", "b_surname_first": true, "same": true, "why": "Igbo short form"}
+{"a": "O. Afolabi", "b": "AFOLABI OLUWAFEMI", "b_surname_first": true, "same": true, "why": "initial"}
+{"a": "Bukky Lawal", "b": "LAWAL BUKOLA", "b_surname_first": true, "same": true, "why": "nickname"}
+{"a": "Engr. Deji Salami", "b": "SALAMI AYODEJI", "b_surname_first": true, "same": true, "why": "title + short form"}
+{"a": "Mohammed Bello", "b": "BELLO MUHAMMAD", "b_surname_first": true, "same": true, "why": "spelling variant"}
+{"a": "Kemi Uzor", "b": "Kemisola Uzor", "b_surname_first": false, "same": true, "why": "short form, same order"}
+{"a": "Chief Bayo Ekwueme", "b": "EKWUEME ADEBAYO", "b_surname_first": true, "same": true, "why": "title + short form"}
+{"a": "Lanre Oyelaran", "b": "OYELARAN OLANREWAJU", "b_surname_first": true, "same": true, "why": "short form"}
+{"a": "Uche Amadi", "b": "AMADI UCHENNA", "b_surname_first": true, "same": true, "why": "short form"}
+{"a": "Amadi Amadi", "b": "Chinedu Amadi", "b_surname_first": false, "same": false, "why": "common surname only"}
+{"a": "Funmi Adeyemi", "b": "ADEYEMI ADEOLA", "b_surname_first": true, "same": false, "why": "same surname, different person"}
+{"a": "Tunde Bello", "b": "BELLO TEMITOPE", "b_surname_first": true, "same": false, "why": "same surname, different person"}
+{"a": "Toyin Okafor", "b": "OKAFOR TOBILOBA", "b_surname_first": true, "same": false, "why": "similar-looking short forms"}
+{"a": "Bayo Eze", "b": "EZE GBENGA", "b_surname_first": true, "same": false, "why": "different Yoruba names"}
+{"a": "Seun Lawal", "b": "LAWAL SEYI", "b_surname_first": true, "same": false, "why": "Seun is not Seyi"}
+{"a": "Femi Ibekwe", "b": "IBEKWE FUNMI", "b_surname_first": true, "same": false, "why": "different people, same initial F"}
+{"a": "Ngozi Eze", "b": "Ngozi Okafor", "b_surname_first": false, "same": false, "why": "same first name only"}
+{"a": "Damilola Afolabi", "b": "AFOLABI DAMILARE", "b_surname_first": true, "same": false, "why": "different names that both shorten to Dami: a known limitation"}
+{"a": "Adebayo Ogunleye", "b": "Adebayo Ogunleye", "b_surname_first": false, "same": true, "why": "exact"}
+{"a": "Aisha Bello", "b": "BELLO AISHATU", "b_surname_first": true, "same": true, "why": "spelling variant"}
+{"a": "Obi Nnadi", "b": "NNADI OBINNA", "b_surname_first": true, "same": true, "why": "short form"}
