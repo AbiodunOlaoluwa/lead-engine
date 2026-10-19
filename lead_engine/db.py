@@ -62,6 +62,12 @@ create table if not exists llm_calls (
   cache_read_tokens int, cost_micros int, at text
 );
 create table if not exists events (id integer primary key, stage text, level text, message text, at text);
+create table if not exists review_decisions (
+  a text not null, b text not null,
+  decision text not null,        -- merge | keep_apart
+  at text not null,
+  primary key (a, b)
+);
 """
 
 
@@ -72,8 +78,10 @@ def now() -> str:
 def connect(path: Path | str) -> sqlite3.Connection:
     if str(path) != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
+    if str(path) != ":memory:":
+        conn.execute("pragma journal_mode = wal")  # the web app reads while a run writes
     conn.executescript(SCHEMA)
     return conn
 
@@ -86,8 +94,19 @@ def mark(conn: sqlite3.Connection, key: str, stage: str, status: str = "done") -
     conn.execute("insert or replace into ledger (key, stage, status, at) values (?, ?, ?, ?)", (key, stage, status, now()))
 
 
+_listener = None
+
+
+def set_listener(fn) -> None:
+    """Called with (stage, level, message) for every logged event; the web app streams these live."""
+    global _listener
+    _listener = fn
+
+
 def log(conn: sqlite3.Connection, stage: str, message: str, level: str = "info") -> None:
     conn.execute("insert into events (stage, level, message, at) values (?, ?, ?, ?)", (stage, level, message, now()))
+    if _listener:
+        _listener(stage, level, message)
 
 
 def jload(v: str | None, default=None):

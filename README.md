@@ -6,7 +6,20 @@ Turns messy public directories into a clean, de-duplicated, scored list of busin
 
 This is a rebuild, on generated fictional data, of the pipeline that sourced Rentyx's sales list: 11,000+ contacts from Nigerian property portals and professional registers. Every rule in it came from something that went wrong on the real data.
 
-![Run report](docs/report.png)
+![Lead Engine running: live progress per stage, retries and rate limits as they happen](docs/app-running.png)
+
+## Try it
+
+```bash
+uv sync --extra llm --group dev
+uv run python -m lead_engine serve        # http://127.0.0.1:8040
+```
+
+Every command is a button: run the pipeline (watchable or fast), crash it at a chosen step and resume, run the crash drill, decide the review queue, export the contacts, open the raw directory pages, and run the evals. Progress is pushed from the engine as it works (server-sent events), so a stage only turns green when the engine says it finished, and warnings appear on the stage that hit them.
+
+| Contacts, with each one's full trail | Review queue: the engine never merges on a name alone |
+| --- | --- |
+| ![Contacts](docs/app-contacts.png) | ![Review](docs/app-review.png) |
 
 ## The pipeline
 
@@ -54,17 +67,19 @@ The hard cases are where the baseline breaks: initials only, "office manager, If
 - **Catch-all domains.** They accept every address and bounce later. One flagged address quarantines its domain.
 - **Common surnames prove nothing alone.** "Amadi Amadi" and "Chinedu Amadi" stay apart.
 
-## Run it
+## Command line
 
 ```bash
-uv sync --extra llm --group dev
 uv run python -m lead_engine generate   # the fictional directory, in data/site
 uv run python -m lead_engine run        # resumable; add --stop-after N to simulate a crash
 uv run python -m lead_engine drill      # crash three times, resume, compare with a clean run
 uv run python -m lead_engine report     # out/report.html
 uv run python -m lead_engine eval       # evals/results.md
+uv run python -m lead_engine serve      # the demo app
 uv run pytest
 ```
+
+There is also a static report of the latest run: `uv run python -m lead_engine report`, then open `out/report.html`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lead Engine · a Rexara Digital demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@600;700;800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <a class="brand" href="#run" aria-label="Lead Engine home">
+        <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="21" height="21" rx="6" fill="var(--ink)"/>
+          <path d="M6 7h12l-4.5 5.2V17l-3 1.5v-6.3z" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/>
+          <circle cx="17.6" cy="17.4" r="2" fill="var(--green-bright)"/>
+        </svg>
+        <span class="brand-name">Lead Engine</span>
+      </a>
+      <span class="mode" id="mode">…</span>
+      <nav class="tabs" aria-label="Sections">
+        <a href="#run" data-tab="run">Run</a>
+        <a href="#contacts" data-tab="contacts">Contacts</a>
+        <a href="#review" data-tab="review">Review <span class="count" id="review-count" hidden></span></a>
+        <a href="#sources" data-tab="sources">Sources</a>
+        <a href="#evals" data-tab="evals">Evals</a>
+      </nav>
+    </div>
+    <div class="topbar-right">
+      <a class="btn btn-ghost btn-sm" href="/report" target="_blank" rel="noopener">Full report</a>
+      <button class="btn btn-ghost btn-sm" id="new-directory" type="button">New directory</button>
+    </div>
+  </header>
+
+  <dialog id="dir-dialog" aria-labelledby="dir-title">
+    <form method="dialog" class="dialog-body" id="dir-form">
+      <h2 id="dir-title">Generate a new directory</h2>
+      <p class="muted">A fresh set of fictional firms across the portal, the register and the profile pages. This clears the current results.</p>
+      <label for="dir-size">Firms</label>
+      <select id="dir-size"><option value="40">40</option><option value="80" selected>80</option><option value="150">150</option><option value="300">300</option></select>
+      <label for="dir-seed">Seed (same seed, same directory)</label>
+      <input id="dir-seed" type="number" value="7" min="0" max="99999">
+      <div class="dialog-actions">
+        <button class="btn btn-ghost" value="cancel" type="submit">Cancel</button>
+        <button class="btn btn-accent" value="go" type="submit">Generate</button>
+      </div>
+    </form>
+  </dialog>
+
+  <main id="view" tabindex="-1"></main>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -6,6 +6,7 @@
   drill             stop a run part-way, resume it, and prove nothing was duplicated
   report            write out/report.html for the latest run
   eval              run the evals in evals/ and write evals/results.md
+  serve             open the demo app at http://127.0.0.1:8040
 """
 from __future__ import annotations
 
@@ -90,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("drill")
     sub.add_parser("report")
     sub.add_parser("eval")
+    sv = sub.add_parser("serve")
+    sv.add_argument("--port", type=int, default=8040)
     args = ap.parse_args(argv)
 
     if args.cmd == "generate":
@@ -107,6 +110,12 @@ def main(argv: list[str] | None = None) -> int:
 
         path = write_report(db.connect(DB_PATH), SITE, Path("out/report.html"))
         print(f"Wrote {path}")
+        return 0
+    if args.cmd == "serve":
+        import uvicorn
+
+        print(f"Lead Engine is running at http://127.0.0.1:{args.port}")
+        uvicorn.run("lead_engine.web:app", host="127.0.0.1", port=args.port, log_level="warning")
         return 0
     if args.cmd == "eval":
         from evals.run_evals import main as run_evals

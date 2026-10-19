@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +23,9 @@ from .score import score
 
 
 ROLE_MAILBOXES = {"info", "hello", "enquiries", "enquiry", "contact", "admin", "office", "sales", "support"}
+
+
+STAGES = ("source", "extract", "enrich", "verify", "match", "score")
 
 
 class Interrupted(Exception):
@@ -45,43 +50,59 @@ class Run:
     budget: Budget = field(default_factory=Budget)
     delay_scale: float = 0.0
     flaky: dict[str, int] = field(default_factory=lambda: {"portal/page-3.html": 1})
+    on_step: Callable[[str, int, int], None] | None = None  # (stage, done, total), for progress displays
+    on_stage: Callable[[str, str], None] | None = None  # (stage, "running" | "done"), reported by the engine itself
+    pace_ms: int = 0  # slows each unit of work so a demo can be watched
+
+    def _progress(self, stage: str, i: int, total: int, worked: bool = True):
+        if self.on_step:
+            self.on_step(stage, i, total)
+        if worked:
+            if self.pace_ms:
+                time.sleep(self.pace_ms / 1000)
+            self.budget.tick()
 
     def all(self) -> dict:
-        self.source()
-        self.extract_profiles()
-        self.enrich()
-        self.verify()
-        self.match()
-        self.score()
-        self.conn.commit()
+        steps = {"source": self.source, "extract": self.extract_profiles, "enrich": self.enrich,
+                 "verify": self.verify, "match": self.match, "score": self.score}
+        for name in STAGES:
+            if self.on_stage:
+                self.on_stage(name, "running")
+            steps[name]()
+            self.conn.commit()
+            if self.on_stage:
+                self.on_stage(name, "done")
         return summary(self.conn)
 
     # ---------------------------------------------------------------- source
     def source(self):
         f = Fetcher(self.conn, FileTransport(self.site, dict(self.flaky)), delay_scale=self.delay_scale)
         f.get("private/admin.html", "portal")  # robots.txt says no: recorded and skipped
+        plan = []
         for source, parser in (("portal", parse_portal_page), ("register", parse_register_page)):
             index = f.get(f"{source}/index.html", source) or ""
-            for href in re.findall(r'href=["\'](page-\d+\.html)["\']', index):
-                path = f"{source}/{href}"
-                if db.done(self.conn, path, "parse"):
-                    continue
-                body = f.get(path, source)
-                if body is None:
-                    continue
-                listings, seen = parser(body, path)
-                for item in listings:
-                    self._insert(item)
-                    if item.get("profile_href"):
-                        f.get(f"{source}/{item['profile_href']}", "profile")
-                self.conn.execute(
-                    "insert or replace into source_counts (page, source, seen, kept) values (?, ?, ?, ?)", (path, source, seen, len(listings))
-                )
-                if seen != len(listings):
-                    db.log(self.conn, "parse", f"{path}: saw {seen} listings but kept {len(listings)}", "error")
-                db.mark(self.conn, path, "parse")
-                self.conn.commit()
-                self.budget.tick()
+            plan += [(source, parser, f"{source}/{href}") for href in re.findall(r'href=["\'](page-\d+\.html)["\']', index)]
+        for i, (source, parser, path) in enumerate(plan, 1):
+            if db.done(self.conn, path, "parse"):
+                self._progress("source", i, len(plan), worked=False)
+                continue
+            body = f.get(path, source)
+            if body is None:
+                self._progress("source", i, len(plan), worked=False)
+                continue
+            listings, seen = parser(body, path)
+            for item in listings:
+                self._insert(item)
+                if item.get("profile_href"):
+                    f.get(f"{source}/{item['profile_href']}", "profile")
+            self.conn.execute(
+                "insert or replace into source_counts (page, source, seen, kept) values (?, ?, ?, ?)", (path, source, seen, len(listings))
+            )
+            if seen != len(listings):
+                db.log(self.conn, "parse", f"{path}: saw {seen} listings but kept {len(listings)}", "error")
+            db.mark(self.conn, path, "parse")
+            self.conn.commit()
+            self._progress("source", i, len(plan))
 
     def _insert(self, item: dict):
         person = parse_person(item.get("contact_raw") or "", surname_first=item["source"] == "register")
@@ -101,8 +122,9 @@ class Run:
     def extract_profiles(self):
         run_extractor = extractor()
         pages = self.conn.execute("select url, body from pages where source = 'profile' and status = 'ok' order by url").fetchall()
-        for p in pages:
+        for i, p in enumerate(pages, 1):
             if db.done(self.conn, p["url"], "extract"):
+                self._progress("extract", i, len(pages), worked=False)
                 continue
             company, text = profile_text(p["body"])
             ex: Extraction = run_extractor(text)
@@ -127,13 +149,14 @@ class Run:
                 db.log(self.conn, "extract", f"{lid}: dropped {len(ex.dropped)} ungrounded field(s)", "warn")
             db.mark(self.conn, p["url"], "extract")
             self.conn.commit()
-            self.budget.tick()
+            self._progress("extract", i, len(pages))
 
     # ---------------------------------------------------------------- enrich
     def enrich(self):
         rows = self.conn.execute("select id, given, emails, company_norm from listings order by id").fetchall()
-        for r in rows:
+        for i, r in enumerate(rows, 1):
             if db.done(self.conn, r["id"], "enrich"):
+                self._progress("enrich", i, len(rows), worked=False)
                 continue
             emails = json.loads(r["emails"])
             if emails:
@@ -144,19 +167,25 @@ class Run:
             else:
                 domain = (r["company_norm"].replace(" ", "") + ".example") if r["company_norm"] else None
                 result, trail = enrich(r["id"], r["given"], domain)
+                for t in trail:
+                    if t["result"] == "timeout":
+                        db.log(self.conn, "enrich", f"{t['provider']} timed out on {r['id']}; retried", "warn")
+                    elif t["result"].startswith("rate limited"):
+                        db.log(self.conn, "enrich", f"{t['provider']} rate-limited us on {r['id']}; backed off and retried", "warn")
                 self.conn.execute(
                     "update listings set email = ?, email_source = ?, enrichment_trail = ? where id = ?",
                     (result["email"] if result else None, result["source"] if result else None, json.dumps(trail), r["id"]),
                 )
             db.mark(self.conn, r["id"], "enrich")
             self.conn.commit()
-            self.budget.tick()
+            self._progress("enrich", i, len(rows))
 
     # ---------------------------------------------------------------- verify
     def verify(self):
         rows = self.conn.execute("select id, email from listings where email is not null order by id").fetchall()
-        for r in rows:
+        for i, r in enumerate(rows, 1):
             if db.done(self.conn, r["id"], "verify"):
+                self._progress("verify", i, len(rows), worked=False)
                 continue
             domain = r["email"].split("@")[-1]
             if self.conn.execute("select 1 from quarantined_domains where domain = ?", (domain,)).fetchone():
@@ -164,6 +193,7 @@ class Run:
             else:
                 status = verify(r["email"])
                 if status == "catch_all":
+                    db.log(self.conn, "verify", f"{domain} accepts any address (catch-all): flagged, domain quarantined", "warn")
                     # Accepts everything, so "valid" means nothing here. Flag it and stop trusting the domain.
                     self.conn.execute(
                         "insert or ignore into quarantined_domains (domain, reason, at) values (?, 'catch-all: accepts any address', ?)",
@@ -172,7 +202,7 @@ class Run:
             self.conn.execute("update listings set email_status = ? where id = ?", (status, r["id"]))
             db.mark(self.conn, r["id"], "verify")
             self.conn.commit()
-            self.budget.tick()
+            self._progress("verify", i, len(rows))
 
     # ---------------------------------------------------------------- match
     def match(self):
@@ -188,7 +218,9 @@ class Run:
                 personal(r["email"], r["email_status"]), r["city"] or "")
             for r in rows
         ]
-        for a, b in candidate_pairs(recs):
+        pairs = candidate_pairs(recs)
+        for i, (a, b) in enumerate(pairs, 1):
+            self._progress("match", i, len(pairs), worked=False)
             s, reasons, decision = compare(a, b)
             if decision == "different":
                 continue
@@ -207,11 +239,20 @@ class Run:
 
         for m in self.conn.execute("select a, b from matches where decision = 'linked'"):
             parent[find(m["a"])] = find(m["b"])
+        # A person's "same" decision on a review pair joins the clusters too, and survives a re-run.
+        for m in self.conn.execute("select a, b from review_decisions where decision = 'merge'"):
+            if m["a"] in parent and m["b"] in parent:
+                parent[find(m["a"])] = find(m["b"])
         for r in recs:
             self.conn.execute("update listings set cluster_id = ? where id = ?", (find(r.id), r.id))
-        review_ids = {x for m in self.conn.execute("select a, b from matches where decision = 'review'") for x in (m["a"], m["b"])}
+        pending = self.conn.execute(
+            """select m.a, m.b from matches m left join review_decisions d on d.a = m.a and d.b = m.b
+               where m.decision = 'review' and d.a is null"""
+        ).fetchall()
+        review_ids = {x for m in pending for x in (m["a"], m["b"])}
+        self.conn.execute("update listings set review_status = 'ready'")
         for lid in review_ids:
-            self.conn.execute("update listings set review_status = 'needs_review' where id = ? and review_status = 'ready'", (lid,))
+            self.conn.execute("update listings set review_status = 'needs_review' where id = ?", (lid,))
         self.conn.commit()
 
     # ---------------------------------------------------------------- score
@@ -220,7 +261,8 @@ class Run:
         clusters: dict[str, list[dict]] = {}
         for r in self.conn.execute("select * from listings").fetchall():
             clusters.setdefault(r["cluster_id"] or r["id"], []).append(dict(r))
-        for members in clusters.values():
+        for i, members in enumerate(clusters.values(), 1):
+            self._progress("score", i, len(clusters), worked=False)
             portal = [m for m in members if m["source"] == "portal"] or members
             combined = {
                 "company": portal[0]["company"],
@@ -251,7 +293,9 @@ def summary(conn: sqlite3.Connection) -> dict:
         "catch_all_or_quarantined": one("select count(*) from listings where email_status in ('catch_all', 'quarantined')"),
         "contacts": one("select count(distinct cluster_id) from listings"),
         "linked_pairs": one("select count(*) from matches where decision = 'linked'"),
-        "review_pairs": one("select count(*) from matches where decision = 'review'"),
+        "review_pairs": one(
+            "select count(*) from matches m left join review_decisions d on d.a = m.a and d.b = m.b where m.decision = 'review' and d.a is null"
+        ),
         "tier1": one("select count(distinct cluster_id) from listings where tier = 1"),
         "dropped_fields": one("select coalesce(sum(json_array_length(dropped_fields)), 0) from listings"),
         "llm_cost_micros": one("select coalesce(sum(cost_micros), 0) from llm_calls"),

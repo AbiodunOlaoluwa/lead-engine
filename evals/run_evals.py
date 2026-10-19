@@ -59,6 +59,20 @@ def eval_matching(meta: dict) -> tuple[list[str], dict]:
     p, r = pr(tp, fp, fn)
     total_same = tp + fn
     rp, _ = pr(rtp, rfp, 0)
+    metrics = {
+        "listings": len(ids),
+        "true_contacts": len(set(truth[i] for i in ids)),
+        "link_precision": p,
+        "wrong_links": fp,
+        "link_recall": r,
+        "linked_true_pairs": tp,
+        "true_pairs": total_same,
+        "review_precision": rp,
+        "review_true": rtp,
+        "review_total": rtp + rfp,
+        "surfaced": f"{surfaced / total_same:.0%}",
+        "surfaced_n": surfaced,
+    }
     rows = [
         "| Measure | Result |",
         "| --- | --- |",
@@ -68,7 +82,7 @@ def eval_matching(meta: dict) -> tuple[list[str], dict]:
         f"| Sent to review: share that really were the same | {rp} ({rtp} of {rtp + rfp}) |",
         f"| True duplicates surfaced (linked or sent to review) | **{surfaced / total_same:.0%}** ({surfaced} of {total_same}) |",
     ]
-    return rows, {"precision": p, "recall": r, "wrong_links": wrong_links[:5]}
+    return rows, {**metrics, "wrong_link_examples": wrong_links[:5]}
 
 
 # ------------------------------------------------------------------ 2. extraction
@@ -93,7 +107,7 @@ def _field_scores(ex: Extraction, want: dict, counts: dict):
     counts["dropped"] += len(ex.dropped)
 
 
-def eval_extraction(meta: dict, cases: list[dict], runners: dict) -> list[str]:
+def eval_extraction(meta: dict, cases: list[dict], runners: dict, structured: list | None = None) -> list[str]:
     firms = {f["id"]: f for f in meta["firms"]}
     generated = []
     for lid, fid in meta["truth"].items():
@@ -119,13 +133,15 @@ def eval_extraction(meta: dict, cases: list[dict], runners: dict) -> list[str]:
                 cost += (ex.usage or {}).get("cost_micros", 0)
                 _field_scores(ex, item, c)
             cells = [" / ".join(pr(c[f"{k}_tp"], c[f"{k}_fp"], c[f"{k}_fn"])) for k in ("name", "phones", "emails")]
+            if structured is not None:
+                structured.append({"extractor": name, "set": set_name, "n": len(items), "name": cells[0], "phones": cells[1], "emails": cells[2], "dropped": c["dropped"], "cost": f"${cost / 1e6:.4f}"})
             rows.append(f"| {name} | {set_name} ({len(items)}) | {cells[0]} | {cells[1]} | {cells[2]} | {c['dropped']} | ${cost / 1e6:.4f} |")
     return rows
 
 
 # ------------------------------------------------------------------ 3. names
 
-def eval_names(pairs: list[dict]) -> tuple[list[str], list[str]]:
+def eval_names(pairs: list[dict], structured: dict | None = None) -> tuple[list[str], list[str]]:
     tp = fp = fn = tn = 0
     misses = []
     for p in pairs:
@@ -143,11 +159,15 @@ def eval_names(pairs: list[dict]) -> tuple[list[str], list[str]]:
         else:
             tn += 1
     prec, rec = pr(tp, fp, fn)
+    if structured is not None:
+        structured.update({"pairs": len(pairs), "precision": prec, "recall": rec, "kept_apart": tn, "different_total": tn + fp, "misses": misses})
     rows = ["| Pairs | Precision | Recall | Correctly kept apart |", "| --- | --- | --- | --- |", f"| {len(pairs)} | {prec} | {rec} | {tn} of {tn + fp} |"]
     return rows, misses
 
 
-def main() -> int:
+def compute(progress=lambda text: None) -> dict:
+    """Run every eval; write evals/results.md and return the numbers for the web app."""
+    progress("Generating a fresh directory for the evals")
     meta = generate(SITE)
     cases = [json.loads(line) for line in (HERE / "extraction_cases.jsonl").read_text().splitlines() if line.strip()]
     pairs = [json.loads(line) for line in (HERE / "name_pairs.jsonl").read_text().splitlines() if line.strip()]
@@ -155,9 +175,14 @@ def main() -> int:
     if os.environ.get("LEAD_ENGINE_MODE") == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
         runners[os.environ.get("LEAD_ENGINE_MODEL", "claude-opus-5")] = extract_claude
 
+    progress("Running the whole pipeline and checking every pair of listings against the truth file")
     match_rows, match_info = eval_matching(meta)
-    extract_rows = eval_extraction(meta, cases, runners)
-    name_rows, misses = eval_names(pairs)
+    progress("Scoring extraction on generated profiles and hand-written hard cases")
+    extraction: list = []
+    extract_rows = eval_extraction(meta, cases, runners, extraction)
+    names: dict = {}
+    progress("Checking the name-matching traps")
+    name_rows, misses = eval_names(pairs, names)
 
     out = [
         "# Eval results",
@@ -184,9 +209,12 @@ def main() -> int:
         "",
     ]
     (HERE / "results.md").write_text("\n".join(out))
-    print("\n".join(out))
-    if match_info["wrong_links"]:
-        print("Wrong links:", match_info["wrong_links"])
+    return {"matching": match_info, "extraction": extraction, "names": names, "markdown": "\n".join(out), "claude": len(runners) > 1}
+
+
+def main() -> int:
+    result = compute()
+    print(result["markdown"])
     return 0
 
 
